@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
 from langgraph.func import entrypoint
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
 
 # Set up checkpointer
 memory = MemorySaver()
@@ -78,7 +79,7 @@ def get_questions():
         }
     ]
 
-def verify_answer(question: Dict[str, Any], answer: str, conversation_history: List[Dict[str, str]]) -> (bool, str):
+def verify_answer(question: Dict[str, Any], answer: str, conversation_history: List[Dict[str, str]], config: Optional[RunnableConfig] = None) -> (bool, str):
     """
     Uses LangChain function calling with Pydantic models to verify if the answer meets requirements.
     Returns a tuple of (is_valid, verification_message).
@@ -119,7 +120,8 @@ def verify_answer(question: Dict[str, Any], answer: str, conversation_history: L
     
     try:
         # Invoke the model with function calling, using proper message objects
-        response = llm_with_verify_tool.invoke([system_message, user_message])
+        # Pass config to enable streaming
+        response = llm_with_verify_tool.invoke([system_message, user_message], config=config)
         
         # Check if we got tool calls
         if response.tool_calls and len(response.tool_calls) > 0:
@@ -173,7 +175,7 @@ def verify_answer_alternative(question: Dict[str, Any], answer: str, conversatio
 
 # The workflow - updated to use improved function calling
 @entrypoint(checkpointer=memory)
-def questionnaire_workflow(action: Dict = None, *, previous: ChatState = None) -> ChatState:
+def questionnaire_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
     """
     A questionnaire workflow with a verification step using LLM function calling.
     
@@ -210,7 +212,7 @@ def questionnaire_workflow(action: Dict = None, *, previous: ChatState = None) -
         
         # Perform verification using the LLM with function calling
         current_question = state.questions[state.current_question_index]
-        is_valid, verification_message = verify_answer(current_question, answer, state.conversation_history)
+        is_valid, verification_message = verify_answer(current_question, answer, state.conversation_history, config)
         
         # Append the verification message from the LLM to the conversation
         state.conversation_history.append({"role": "ai", "content": verification_message})
