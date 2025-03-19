@@ -1,4 +1,4 @@
-# api.py - Updated to work with the verification step
+# api.py - Simplified approach without HIL API
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from uuid import uuid4
 from typing import Dict, Optional, List
 import uvicorn
 
-# Import our updated workflow and ChatState from graph.py
+# Import our workflow from graph.py
 from graph import questionnaire_workflow, ChatState
 
 app = FastAPI()
@@ -28,25 +28,24 @@ class NextResponse(BaseModel):
     waiting_for_input: bool
 
 def get_current_question(conversation_history: List[Dict[str, str]]) -> str:
-    """Extract the most recent AI message from conversation history as a string."""
+    """Extract the most recent AI message from conversation history."""
     for msg in reversed(conversation_history):
         if msg.get("role") == "ai":
-            content = msg.get("content", "")
-            if not isinstance(content, str):
-                content = str(content)
-            return content
+            return msg.get("content", "")
     return ""
-
 
 @app.post("/start", response_model=StartResponse)
 def start_session():
     """Start a new questionnaire session."""
-    # Generate a unique thread ID for checkpointing
+    # Generate a unique thread ID
     thread_id = str(uuid4())
     config = {"configurable": {"thread_id": thread_id}}
     
     try:
+        # Start the workflow
         result = questionnaire_workflow.invoke({"action": "start"}, config)
+        
+        # Extract state information
         conversation_history = result.conversation_history
         current_question = get_current_question(conversation_history)
         is_completed = result.is_complete
@@ -65,14 +64,17 @@ def start_session():
 
 @app.post("/next", response_model=NextResponse)
 def next_step(req: NextRequest):
-    """Process the user's answer and return the next question (or follow-up verification)."""
+    """Process user answer and get the next question."""
     config = {"configurable": {"thread_id": req.session_id}}
     
     try:
+        # Submit the answer
         result = questionnaire_workflow.invoke(
             {"action": "answer", "answer": req.answer}, 
             config
         )
+        
+        # Extract state information
         conversation_history = result.conversation_history
         current_question = get_current_question(conversation_history)
         is_completed = result.is_complete
@@ -89,13 +91,16 @@ def next_step(req: NextRequest):
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error processing answer: {str(e)}")
 
+# Debug endpoint
 @app.get("/debug/{session_id}")
 def debug_session(session_id: str):
-    """Retrieve the current session state for debugging."""
+    """Get details about the current session state."""
     config = {"configurable": {"thread_id": session_id}}
     
     try:
+        # Get current state directly
         current_state = questionnaire_workflow.get_state(config)
+        
         if hasattr(current_state, "values"):
             state = current_state.values
             return {
