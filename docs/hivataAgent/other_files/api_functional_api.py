@@ -10,7 +10,7 @@ import asyncio
 from fastapi.responses import StreamingResponse
 
 # Import our updated workflow and ChatState from graph.py
-from question_answer import question_answer_workflow, ChatState
+from graph import questionnaire_workflow, ChatState
 
 app = FastAPI()
 
@@ -49,7 +49,7 @@ def start_session():
     config = {"configurable": {"thread_id": thread_id}}
     
     try:
-        result = question_answer_workflow.invoke({"action": "start"}, config)
+        result = questionnaire_workflow.invoke({"action": "start"}, config)
         conversation_history = result.conversation_history
         current_question = get_current_question(conversation_history)
         is_completed = result.is_complete
@@ -72,7 +72,7 @@ def next_step(req: NextRequest):
     config = {"configurable": {"thread_id": req.session_id}}
     
     try:
-        result = question_answer_workflow.invoke(
+        result = questionnaire_workflow.invoke(
             {"action": "answer", "answer": req.answer}, 
             config
         )
@@ -99,7 +99,7 @@ async def stream_next_step(req: NextRequest) -> StreamingResponse:
     
     try:
         # First get the current state to properly compare later
-        current_state = question_answer_workflow.get_state(config)
+        current_state = questionnaire_workflow.get_state(config)
         current_conversation_length = len(current_state.values.conversation_history)
         
         # Use astream to stream message tokens
@@ -110,7 +110,7 @@ async def stream_next_step(req: NextRequest) -> StreamingResponse:
             
             print(f"Streaming started for session {req.session_id}")
             
-            async for event, chunk in question_answer_workflow.astream(
+            async for event, chunk in questionnaire_workflow.astream(
                 {"action": "answer", "answer": req.answer},
                 config,
                 stream_mode="messages"
@@ -131,7 +131,7 @@ async def stream_next_step(req: NextRequest) -> StreamingResponse:
             print(f"Finished streaming {token_count} tokens")
             
             # Get the final state after streaming is complete
-            final_state = question_answer_workflow.get_state(config)
+            final_state = questionnaire_workflow.get_state(config)
             final_conversation = final_state.values.conversation_history
             
             # Calculate which is the verification message (should be the new message after user input)
@@ -183,7 +183,7 @@ def debug_session(session_id: str):
     config = {"configurable": {"thread_id": session_id}}
     
     try:
-        current_state = question_answer_workflow.get_state(config)
+        current_state = questionnaire_workflow.get_state(config)
         if hasattr(current_state, "values"):
             state = current_state.values
             return {
