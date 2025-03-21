@@ -9,7 +9,7 @@ from langgraph.func import entrypoint, task
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
-# Import the shared state
+# Import the shared state and helper functions
 from state import ChatState, add_to_extraction_queue
 
 # Set up the LLM for verification
@@ -150,7 +150,7 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
     
     Modified to add verified answers to the extraction queue for the term extractor.
     """
-    # Use previous state or initialize a new one
+    # Use previous state or initialize a new one with questions
     state = previous if previous is not None else ChatState(questions=get_questions())
     
     if action is None:
@@ -194,10 +194,14 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
                 "answer": answer,
                 "verification": verification_message
             }
+            # Debug log for verified answers
+            print(f"[DEBUG QA] Verified answers: {json.dumps(state.verified_answers, indent=2)}")
             
-            # Add to the extraction queue for the term extractor
-            add_to_extraction_queue(state, state.current_question_index)
+            # Ensure the verified answer is added to the extraction queue
+            state = add_to_extraction_queue(state, state.current_question_index)
+            print(f"[DEBUG QA] Extraction queue after adding index {state.current_question_index}: {state.term_extraction_queue}")
             
+            # Move to the next question
             state.current_question_index += 1
             if state.current_question_index >= len(state.questions):
                 state.is_complete = True
@@ -208,13 +212,11 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
             else:
                 # Present the next question
                 next_question = state.questions[state.current_question_index]
-                # Format requirements as bullet points for better readability
                 formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in next_question['requirements'].items()])
                 prompt = f"{next_question['text']}\n\nRequirements:\n{formatted_requirements}"
                 state.conversation_history.append({"role": "ai", "content": prompt})
         else:
-            # If the answer is invalid, the follow-up questions remain visible.
-            # The same question remains active so the user can try answering again.
+            # If the answer is invalid, the same question remains active for the user to try again.
             pass
     
     return state

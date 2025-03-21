@@ -1,0 +1,1940 @@
+EXAMPLES AND INSTRUCTIONS ON BUILDING A MULTI-AGENT ARCHITECTURE
+
+# How to add multi-turn conversation in a multi-agent application (functional API)
+
+!!! info "Prerequisites"
+    This guide assumes familiarity with the following:
+
+    - [Multi-agent systems](../../concepts/multi_agent)
+    - [Human-in-the-loop](../../concepts/human_in_the_loop)
+    - [Functional API](../../concepts/functional_api)
+    - [Command](../../concepts/low_level/#command)
+    - [LangGraph Glossary](../../concepts/low_level/)
+
+
+In this how-to guide, we’ll build an application that allows an end-user to engage in a *multi-turn conversation* with one or more agents. We'll create a node that uses an [`interrupt`](../../reference/types/#langgraph.types.interrupt) to collect user input and routes back to the **active** agent.
+
+The agents will be implemented as tasks in a workflow that executes agent steps and determines the next action:
+
+1. **Wait for user input** to continue the conversation, or
+2. **Route to another agent** (or back to itself, such as in a loop) via a [**handoff**](../../concepts/multi_agent/#handoffs).
+
+```python
+from langgraph.func import entrypoint, task
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import tool
+from langgraph.types import interrupt
+
+
+# Define a tool to signal intent to hand off to a different agent
+# Note: this is not using Command(goto) syntax for navigating to different agents:
+# `workflow()` below handles the handoffs explicitly
+@tool(return_direct=True)
+def transfer_to_hotel_advisor():
+    """Ask hotel advisor agent for help."""
+    return "Successfully transferred to hotel advisor"
+
+
+# define an agent
+travel_advisor_tools = [transfer_to_hotel_advisor, ...]
+travel_advisor = create_react_agent(model, travel_advisor_tools)
+
+
+# define a task that calls an agent
+@task
+def call_travel_advisor(messages):
+    response = travel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+# define the multi-agent network workflow
+@entrypoint(checkpointer)
+def workflow(messages):
+    call_active_agent = call_travel_advisor
+    while True:
+        agent_messages = call_active_agent(messages).result()
+        ai_msg = get_last_ai_msg(agent_messages)
+        if not ai_msg.tool_calls:
+            user_input = interrupt(value="Ready for user input.")
+            messages = messages + [{"role": "user", "content": user_input}]
+            continue
+
+        messages = messages + agent_messages
+        call_active_agent = get_next_agent(messages)
+    return entrypoint.final(value=agent_messages[-1], save=messages)
+```
+## Setup
+
+First, let's install the required packages
+# %%capture --no-stderr
+# %pip install -U langgraph langchain-anthropic
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+In this example we will build a team of travel assistant agents that can communicate with each other.
+
+We will create 2 agents:
+
+* `travel_advisor`: can help with travel destination recommendations. Can ask `hotel_advisor` for help.
+* `hotel_advisor`: can help with hotel recommendations. Can ask `travel_advisor` for help.
+
+This is a fully-connected network - every agent can talk to any other agent. 
+import random
+from typing_extensions import Literal
+from langchain_core.tools import tool
+
+
+@tool
+def get_travel_recommendations():
+    """Get recommendation for travel destinations"""
+    return random.choice(["aruba", "turks and caicos"])
+
+
+@tool
+def get_hotel_recommendations(location: Literal["aruba", "turks and caicos"]):
+    """Get hotel recommendations for a given destination."""
+    return {
+        "aruba": [
+            "The Ritz-Carlton, Aruba (Palm Beach)"
+            "Bucuti & Tara Beach Resort (Eagle Beach)"
+        ],
+        "turks and caicos": ["Grace Bay Club", "COMO Parrot Cay"],
+    }[location]
+
+
+@tool(return_direct=True)
+def transfer_to_hotel_advisor():
+    """Ask hotel advisor agent for help."""
+    return "Successfully transferred to hotel advisor"
+
+
+@tool(return_direct=True)
+def transfer_to_travel_advisor():
+    """Ask travel advisor agent for help."""
+    return "Successfully transferred to travel advisor"
+!!! note "Transfer tools"
+
+    You might have noticed that we're using `@tool(return_direct=True)` in the transfer tools. This is done so that individual agents (e.g., `travel_advisor`) can exit the ReAct loop early once these tools are called. This is the desired behavior, as we want to detect when the agent calls this tool and hand control off _immediately_ to a different agent. 
+    
+    **NOTE**: This is meant to work with the prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent] -- if you are building a custom agent, make sure to manually add logic for handling early exit for tools that are marked with `return_direct`.
+Let's now create our agents using the the prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent] and our multi-agent workflow. Note that will be calling [`interrupt`][langgraph.types.interrupt] every time after we get the final response from each of the agents.
+import uuid
+
+from langchain_core.messages import AIMessage
+from langchain_anthropic import ChatAnthropic
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import add_messages
+from langgraph.func import entrypoint, task
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+# Define travel advisor ReAct agent
+travel_advisor_tools = [
+    get_travel_recommendations,
+    transfer_to_hotel_advisor,
+]
+travel_advisor = create_react_agent(
+    model,
+    travel_advisor_tools,
+    state_modifier=(
+        "You are a general travel expert that can recommend travel destinations (e.g. countries, cities, etc). "
+        "If you need hotel recommendations, ask 'hotel_advisor' for help. "
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+@task
+def call_travel_advisor(messages):
+    # You can also add additional logic like changing the input to the agent / output from the agent, etc.
+    # NOTE: we're invoking the ReAct agent with the full history of messages in the state
+    response = travel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+# Define hotel advisor ReAct agent
+hotel_advisor_tools = [get_hotel_recommendations, transfer_to_travel_advisor]
+hotel_advisor = create_react_agent(
+    model,
+    hotel_advisor_tools,
+    state_modifier=(
+        "You are a hotel expert that can provide hotel recommendations for a given destination. "
+        "If you need help picking travel destinations, ask 'travel_advisor' for help."
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+@task
+def call_hotel_advisor(messages):
+    response = hotel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+checkpointer = MemorySaver()
+
+
+def string_to_uuid(input_string):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, input_string))
+
+
+@entrypoint(checkpointer=checkpointer)
+def multi_turn_graph(messages, previous):
+    previous = previous or []
+    messages = add_messages(previous, messages)
+    call_active_agent = call_travel_advisor
+    while True:
+        agent_messages = call_active_agent(messages).result()
+        messages = add_messages(messages, agent_messages)
+        # Find the last AI message
+        # If one of the handoff tools is called, the last message returned
+        # by the agent will be a ToolMessage because we set them to have
+        # "return_direct=True". This means that the last AIMessage will
+        # have tool calls.
+        # Otherwise, the last returned message will be an AIMessage with
+        # no tool calls, which means we are ready for new input.
+        ai_msg = next(m for m in reversed(agent_messages) if isinstance(m, AIMessage))
+        if not ai_msg.tool_calls:
+            user_input = interrupt(value="Ready for user input.")
+            # Add user input as a human message
+            # NOTE: we generate unique ID for the human message based on its content
+            # it's important, since on subsequent invocations previous user input (interrupt) values
+            # will be looked up again and we will attempt to add them again here
+            # `add_messages` deduplicates messages based on the ID, ensuring correct message history
+            human_message = {
+                "role": "user",
+                "content": user_input,
+                "id": string_to_uuid(user_input),
+            }
+            messages = add_messages(messages, [human_message])
+            continue
+
+        tool_call = ai_msg.tool_calls[-1]
+        if tool_call["name"] == "transfer_to_hotel_advisor":
+            call_active_agent = call_hotel_advisor
+        elif tool_call["name"] == "transfer_to_travel_advisor":
+            call_active_agent = call_travel_advisor
+        else:
+            raise ValueError(f"Expected transfer tool, got '{tool_call['name']}'")
+
+    return entrypoint.final(value=agent_messages[-1], save=messages)
+## Test multi-turn conversation
+
+Let's test a multi turn conversation with this application.
+thread_config = {"configurable": {"thread_id": uuid.uuid4()}}
+
+inputs = [
+    # 1st round of conversation,
+    {
+        "role": "user",
+        "content": "i wanna go somewhere warm in the caribbean",
+        "id": str(uuid.uuid4()),
+    },
+    # Since we're using `interrupt`, we'll need to resume using the Command primitive.
+    # 2nd round of conversation,
+    Command(
+        resume="could you recommend a nice hotel in one of the areas and tell me which area it is."
+    ),
+    # 3rd round of conversation,
+    Command(
+        resume="i like the first one. could you recommend something to do near the hotel?"
+    ),
+]
+
+for idx, user_input in enumerate(inputs):
+    print()
+    print(f"--- Conversation Turn {idx + 1} ---")
+    print()
+    print(f"User: {user_input}")
+    print()
+    for update in multi_turn_graph.stream(
+        user_input,
+        config=thread_config,
+        stream_mode="updates",
+    ):
+        for node_id, value in update.items():
+            if isinstance(value, list) and value:
+                last_message = value[-1]
+                if isinstance(last_message, dict) or last_message.type != "ai":
+                    continue
+                print(f"{node_id}: {last_message.content}")
+
+
+
+# How to build a multi-agent network (functional API)
+!!! info "Prerequisites" 
+    This guide assumes familiarity with the following:
+
+    - [Multi-agent systems](../../concepts/multi_agent)
+    - [Functional API](../../concepts/functional_api)
+    - [Command](../../concepts/low_level/#command)
+    - [LangGraph Glossary](../../concepts/low_level/)
+
+In this how-to guide we will demonstrate how to implement a [multi-agent network](../../concepts/multi_agent#network) architecture where each agent can communicate with every other agent (many-to-many connections) and can decide which agent to call next. We will be using [functional API](../../concepts/functional_api) — individual agents will be defined as tasks and the agent handoffs will be defined in the main [entrypoint()][langgraph.func.entrypoint]:
+
+```python
+from langgraph.func import entrypoint
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import tool
+
+
+# Define a tool to signal intent to hand off to a different agent
+@tool(return_direct=True)
+def transfer_to_hotel_advisor():
+    """Ask hotel advisor agent for help."""
+    return "Successfully transferred to hotel advisor"
+
+
+# define an agent
+travel_advisor_tools = [transfer_to_hotel_advisor, ...]
+travel_advisor = create_react_agent(model, travel_advisor_tools)
+
+
+# define a task that calls an agent
+@task
+def call_travel_advisor(messages):
+    response = travel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+# define the multi-agent network workflow
+@entrypoint()
+def workflow(messages):
+    call_active_agent = call_travel_advisor
+    while True:
+        agent_messages = call_active_agent(messages).result()
+        messages = messages + agent_messages
+        call_active_agent = get_next_agent(messages)
+    return messages
+```
+## Setup
+
+First, let's install the required packages
+%%capture --no-stderr
+%pip install -U langgraph langchain-anthropic
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Travel agent example
+In this example we will build a team of travel assistant agents that can communicate with each other.
+
+We will create 2 agents:
+
+* `travel_advisor`: can help with travel destination recommendations. Can ask `hotel_advisor` for help.
+* `hotel_advisor`: can help with hotel recommendations. Can ask `travel_advisor` for help.
+
+This is a fully-connected network - every agent can talk to any other agent. 
+First, let's create some of the tools that the agents will be using:
+import random
+from typing_extensions import Literal
+from langchain_core.tools import tool
+
+
+@tool
+def get_travel_recommendations():
+    """Get recommendation for travel destinations"""
+    return random.choice(["aruba", "turks and caicos"])
+
+
+@tool
+def get_hotel_recommendations(location: Literal["aruba", "turks and caicos"]):
+    """Get hotel recommendations for a given destination."""
+    return {
+        "aruba": [
+            "The Ritz-Carlton, Aruba (Palm Beach)"
+            "Bucuti & Tara Beach Resort (Eagle Beach)"
+        ],
+        "turks and caicos": ["Grace Bay Club", "COMO Parrot Cay"],
+    }[location]
+
+
+@tool(return_direct=True)
+def transfer_to_hotel_advisor():
+    """Ask hotel advisor agent for help."""
+    return "Successfully transferred to hotel advisor"
+
+
+@tool(return_direct=True)
+def transfer_to_travel_advisor():
+    """Ask travel advisor agent for help."""
+    return "Successfully transferred to travel advisor"
+!!! note "Transfer tools"
+
+    You might have noticed that we're using `@tool(return_direct=True)` in the transfer tools. This is done so that individual agents (e.g., `travel_advisor`) can exit the ReAct loop early once these tools are called. This is the desired behavior, as we want to detect when the agent calls this tool and hand control off _immediately_ to a different agent. 
+    
+    **NOTE**: This is meant to work with the prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent] -- if you are building a custom agent, make sure to manually add logic for handling early exit for tools that are marked with `return_direct`.
+Now let's define our agent tasks and combine them into a single multi-agent network workflow:
+from langchain_core.messages import AIMessage
+from langchain_anthropic import ChatAnthropic
+from langgraph.prebuilt import create_react_agent
+from langgraph.graph import add_messages
+from langgraph.func import entrypoint, task
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+# Define travel advisor ReAct agent
+travel_advisor_tools = [
+    get_travel_recommendations,
+    transfer_to_hotel_advisor,
+]
+travel_advisor = create_react_agent(
+    model,
+    travel_advisor_tools,
+    state_modifier=(
+        "You are a general travel expert that can recommend travel destinations (e.g. countries, cities, etc). "
+        "If you need hotel recommendations, ask 'hotel_advisor' for help. "
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+@task
+def call_travel_advisor(messages):
+    # You can also add additional logic like changing the input to the agent / output from the agent, etc.
+    # NOTE: we're invoking the ReAct agent with the full history of messages in the state
+    response = travel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+# Define hotel advisor ReAct agent
+hotel_advisor_tools = [get_hotel_recommendations, transfer_to_travel_advisor]
+hotel_advisor = create_react_agent(
+    model,
+    hotel_advisor_tools,
+    state_modifier=(
+        "You are a hotel expert that can provide hotel recommendations for a given destination. "
+        "If you need help picking travel destinations, ask 'travel_advisor' for help."
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+@task
+def call_hotel_advisor(messages):
+    response = hotel_advisor.invoke({"messages": messages})
+    return response["messages"]
+
+
+@entrypoint()
+def workflow(messages):
+    messages = add_messages([], messages)
+
+    call_active_agent = call_travel_advisor
+    while True:
+        agent_messages = call_active_agent(messages).result()
+        messages = add_messages(messages, agent_messages)
+        ai_msg = next(m for m in reversed(agent_messages) if isinstance(m, AIMessage))
+        if not ai_msg.tool_calls:
+            break
+
+        tool_call = ai_msg.tool_calls[-1]
+        if tool_call["name"] == "transfer_to_travel_advisor":
+            call_active_agent = call_travel_advisor
+        elif tool_call["name"] == "transfer_to_hotel_advisor":
+            call_active_agent = call_hotel_advisor
+        else:
+            raise ValueError(f"Expected transfer tool, got '{tool_call['name']}'")
+
+    return messages
+Lastly, let's define a helper to render the agent outputs:
+from langchain_core.messages import convert_to_messages
+
+
+def pretty_print_messages(update):
+    if isinstance(update, tuple):
+        ns, update = update
+        # skip parent graph updates in the printouts
+        if len(ns) == 0:
+            return
+
+        graph_id = ns[-1].split(":")[0]
+        print(f"Update from subgraph {graph_id}:")
+        print("\n")
+
+    for node_name, node_update in update.items():
+        print(f"Update from node {node_name}:")
+        print("\n")
+
+        for m in convert_to_messages(node_update["messages"]):
+            m.pretty_print()
+        print("\n")
+Let's test it out using the same input as our original multi-agent system:
+for chunk in workflow.stream(
+    [
+        {
+            "role": "user",
+            "content": "i wanna go somewhere warm in the caribbean. pick one destination and give me hotel recommendations",
+        }
+    ],
+    subgraphs=True,
+):
+    pretty_print_messages(chunk)
+Voila - `travel_advisor` picks a destination and then makes a decision to call `hotel_advisor` for more info!
+
+
+# How to add cross-thread persistence (functional API)
+
+!!! info "Prerequisites"
+
+    This guide assumes familiarity with the following:
+    
+    - [Functional API](../../concepts/functional_api/)
+    - [Persistence](../../concepts/persistence/)
+    - [Memory](../../concepts/memory/)
+    - [Chat Models](https://python.langchain.com/docs/concepts/chat_models/)
+
+LangGraph allows you to persist data across **different [threads](../../concepts/persistence/#threads)**. For instance, you can store information about users (their names or preferences) in a shared (cross-thread) memory and reuse them in the new threads (e.g., new conversations).
+
+When using the [functional API](../../concepts/functional_api/), you can set it up to store and retrieve memories by using the [Store](https://langchain-ai.github.io/langgraph/reference/store/#langgraph.store.base.BaseStore) interface:
+
+1. Create an instance of a `Store`
+
+    ```python
+    from langgraph.store.memory import InMemoryStore, BaseStore
+    
+    store = InMemoryStore()
+    ```
+
+2. Pass the `store` instance to the `entrypoint()` decorator and expose `store` parameter in the function signature:
+
+    ```python
+    from langgraph.func import entrypoint
+
+    @entrypoint(store=store)
+    def workflow(inputs: dict, store: BaseStore):
+        my_task(inputs).result()
+        ...
+    ```
+    
+In this guide, we will show how to construct and use a workflow that has a shared memory implemented using the [Store](https://langchain-ai.github.io/langgraph/reference/store/#langgraph.store.base.BaseStore) interface.
+
+!!! note Note
+
+    Support for the [`Store`](https://langchain-ai.github.io/langgraph/reference/store/#langgraph.store.base.BaseStore) API that is used in this guide was added in LangGraph `v0.2.32`.
+
+    Support for __index__ and __query__ arguments of the [`Store`](https://langchain-ai.github.io/langgraph/reference/store/#langgraph.store.base.BaseStore) API that is used in this guide was added in LangGraph `v0.2.54`.
+
+!!! tip "Note"
+
+    If you need to add cross-thread persistence to a `StateGraph`, check out this [how-to guide](../cross-thread-persistence).
+
+## Setup
+
+First, let's install the required packages and set our API keys
+%%capture --no-stderr
+%pip install -U langchain_anthropic langchain_openai langgraph
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+_set_env("OPENAI_API_KEY")
+!!! tip "Set up [LangSmith](https://smith.langchain.com) for LangGraph development"
+
+    Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started [here](https://docs.smith.langchain.com)
+## Example: simple chatbot with long-term memory
+### Define store
+
+In this example we will create a workflow that will be able to retrieve information about a user's preferences. We will do so by defining an `InMemoryStore` - an object that can store data in memory and query that data.
+
+When storing objects using the `Store` interface you define two things:
+
+* the namespace for the object, a tuple (similar to directories)
+* the object key (similar to filenames)
+
+In our example, we'll be using `("memories", <user_id>)` as namespace and random UUID as key for each new memory.
+
+Importantly, to determine the user, we will be passing `user_id` via the config keyword argument of the node function.
+
+Let's first define our store!
+from langgraph.store.memory import InMemoryStore
+from langchain_openai import OpenAIEmbeddings
+
+in_memory_store = InMemoryStore(
+    index={
+        "embed": OpenAIEmbeddings(model="text-embedding-3-small"),
+        "dims": 1536,
+    }
+)
+### Create workflow
+import uuid
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import BaseMessage
+from langgraph.func import entrypoint, task
+from langgraph.graph import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.base import BaseStore
+
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+
+@task
+def call_model(messages: list[BaseMessage], memory_store: BaseStore, user_id: str):
+    namespace = ("memories", user_id)
+    last_message = messages[-1]
+    memories = memory_store.search(namespace, query=str(last_message.content))
+    info = "\n".join([d.value["data"] for d in memories])
+    system_msg = f"You are a helpful assistant talking to the user. User info: {info}"
+
+    # Store new memories if the user asks the model to remember
+    if "remember" in last_message.content.lower():
+        memory = "User name is Bob"
+        memory_store.put(namespace, str(uuid.uuid4()), {"data": memory})
+
+    response = model.invoke([{"role": "system", "content": system_msg}] + messages)
+    return response
+
+
+# NOTE: we're passing the store object here when creating a workflow via entrypoint()
+@entrypoint(checkpointer=MemorySaver(), store=in_memory_store)
+def workflow(
+    inputs: list[BaseMessage],
+    *,
+    previous: list[BaseMessage],
+    config: RunnableConfig,
+    store: BaseStore,
+):
+    user_id = config["configurable"]["user_id"]
+    previous = previous or []
+    inputs = add_messages(previous, inputs)
+    response = call_model(inputs, store, user_id).result()
+    return entrypoint.final(value=response, save=add_messages(inputs, response))
+!!! note Note
+
+    If you're using LangGraph Cloud or LangGraph Studio, you __don't need__ to pass store to the entrypoint decorator, since it's done automatically.
+### Run the workflow!
+Now let's specify a user ID in the config and tell the model our name:
+config = {"configurable": {"thread_id": "1", "user_id": "1"}}
+input_message = {"role": "user", "content": "Hi! Remember: my name is Bob"}
+for chunk in workflow.stream([input_message], config, stream_mode="values"):
+    chunk.pretty_print()
+config = {"configurable": {"thread_id": "2", "user_id": "1"}}
+input_message = {"role": "user", "content": "what is my name?"}
+for chunk in workflow.stream([input_message], config, stream_mode="values"):
+    chunk.pretty_print()
+We can now inspect our in-memory store and verify that we have in fact saved the memories for the user:
+for memory in in_memory_store.search(("memories", "1")):
+    print(memory.value)
+Let's now run the workflow for another user to verify that the memories about the first user are self contained:
+config = {"configurable": {"thread_id": "3", "user_id": "2"}}
+input_message = {"role": "user", "content": "what is my name?"}
+for chunk in workflow.stream([input_message], config, stream_mode="values"):
+    chunk.pretty_print()
+
+
+
+# How to add thread-level persistence (functional API)
+
+!!! info "Prerequisites"
+
+    This guide assumes familiarity with the following:
+    
+    - [Functional API](../../concepts/functional_api/)
+    - [Persistence](../../concepts/persistence/)
+    - [Memory](../../concepts/memory/)
+    - [Chat Models](https://python.langchain.com/docs/concepts/chat_models/)
+
+Many AI applications need memory to share context across multiple interactions on the same [thread](../../concepts/persistence#threads) (e.g., multiple turns of a conversation). In LangGraph functional API, this kind of memory can be added to any [entrypoint()][langgraph.func.entrypoint] workflow using [thread-level persistence](https://langchain-ai.github.io/langgraph/concepts/persistence).
+
+When creating a LangGraph workflow, you can set it up to persist its results by using a [checkpointer](https://langchain-ai.github.io/langgraph/reference/checkpoints/#basecheckpointsaver):
+
+
+1. Create an instance of a checkpointer:
+
+    ```python
+    from langgraph.checkpoint.memory import MemorySaver
+    
+    checkpointer = MemorySaver()       
+    ```
+
+2. Pass `checkpointer` instance to the `entrypoint()` decorator:
+
+    ```python
+    from langgraph.func import entrypoint
+    
+    @entrypoint(checkpointer=checkpointer)
+    def workflow(inputs)
+        ...
+    ```
+
+3. Optionally expose `previous` parameter in the workflow function signature:
+
+    ```python
+    @entrypoint(checkpointer=checkpointer)
+    def workflow(
+        inputs,
+        *,
+        # you can optionally specify `previous` in the workflow function signature
+        # to access the return value from the workflow as of the last execution
+        previous
+    ):
+        previous = previous or []
+        combined_inputs = previous + inputs
+        result = do_something(combined_inputs)
+        ...
+    ```
+
+4. Optionally choose which values will be returned from the workflow and which will be saved by the checkpointer as `previous`:
+
+    ```python
+    @entrypoint(checkpointer=checkpointer)
+    def workflow(inputs, *, previous):
+        ...
+        result = do_something(...)
+        return entrypoint.final(value=result, save=combine(inputs, result))
+    ```
+
+This guide shows how you can add thread-level persistence to your workflow.
+
+!!! tip "Note"
+
+    If you need memory that is __shared__ across multiple conversations or users (cross-thread persistence), check out this [how-to guide](../cross-thread-persistence-functional).
+
+!!! tip "Note"
+
+    If you need to add thread-level persistence to a `StateGraph`, check out this [how-to guide](../persistence).
+## Setup
+
+First we need to install the packages required
+%%capture --no-stderr
+%pip install --quiet -U langgraph langchain_anthropic
+Next, we need to set API key for Anthropic (the LLM we will use).
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Example: simple chatbot with short-term memory
+
+We will be using a workflow with a single task that calls a [chat model](https://python.langchain.com/docs/concepts/chat_models/).
+
+Let's first define the model we'll be using:
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+Now we can define our task and workflow. To add in persistence, we need to pass in a [Checkpointer](https://langchain-ai.github.io/langgraph/reference/checkpoints/#langgraph.checkpoint.base.BaseCheckpointSaver) to the [entrypoint()][langgraph.func.entrypoint] decorator.
+from langchain_core.messages import BaseMessage
+from langgraph.graph import add_messages
+from langgraph.func import entrypoint, task
+from langgraph.checkpoint.memory import MemorySaver
+
+
+@task
+def call_model(messages: list[BaseMessage]):
+    response = model.invoke(messages)
+    return response
+
+
+checkpointer = MemorySaver()
+
+
+@entrypoint(checkpointer=checkpointer)
+def workflow(inputs: list[BaseMessage], *, previous: list[BaseMessage]):
+    if previous:
+        inputs = add_messages(previous, inputs)
+
+    response = call_model(inputs).result()
+    return entrypoint.final(value=response, save=add_messages(inputs, response))
+If we try to use this workflow, the context of the conversation will be persisted across interactions:
+!!! note Note
+
+    If you're using LangGraph Cloud or LangGraph Studio, you __don't need__ to pass checkpointer to the entrypoint decorator, since it's done automatically.
+We can now interact with the agent and see that it remembers previous messages!
+config = {"configurable": {"thread_id": "1"}}
+input_message = {"role": "user", "content": "hi! I'm bob"}
+for chunk in workflow.stream([input_message], config, stream_mode="values"):
+    chunk.pretty_print()
+You can always resume previous threads:
+input_message = {"role": "user", "content": "what's my name?"}
+for chunk in workflow.stream([input_message], config, stream_mode="values"):
+    chunk.pretty_print()
+If we want to start a new conversation, we can pass in a different `thread_id`. Poof! All the memories are gone!
+input_message = {"role": "user", "content": "what's my name?"}
+for chunk in workflow.stream(
+    [input_message],
+    {"configurable": {"thread_id": "2"}},
+    stream_mode="values",
+):
+    chunk.pretty_print()
+!!! tip "Streaming tokens"
+
+    If you would like to stream LLM tokens from your chatbot, you can use `stream_mode="messages"`. Check out this [how-to guide](../streaming-tokens) to learn more.
+
+
+
+# How to implement handoffs between agents
+!!! info "Prerequisites"
+    This guide assumes familiarity with the following:
+
+    - [Multi-agent systems](../../concepts/multi_agent)
+    - [Command](../../concepts/low_level/#command)
+    - [LangGraph Glossary](../../concepts/low_level/)
+    
+
+In multi-agent architectures, agents can be represented as graph nodes. Each agent node executes its step(s) and decides whether to finish execution or route to another agent, including potentially routing to itself (e.g., running in a loop). A natural pattern in multi-agent interactions is [handoffs](../../concepts/multi_agent#handoffs), where one agent hands off control to another. Handoffs allow you to specify:
+
+- **destination**: target agent to navigate to - node name in LangGraph
+- **payload**: information to pass to that agent - state update in LangGraph
+
+To implement handoffs in LangGraph, agent nodes can return `Command` object that allows you to [combine both control flow and state updates](../command):
+
+```python
+def agent(state) -> Command[Literal["agent", "another_agent"]]:
+    # the condition for routing/halting can be anything, e.g. LLM tool call / structured output, etc.
+    goto = get_next_agent(...)  # 'agent' / 'another_agent'
+    return Command(
+        # Specify which agent to call next
+        goto=goto,
+        # Update the graph state
+        update={"my_state_key": "my_state_value"}
+    )
+```
+
+One of the most common agent types is a tool-calling agent. For those types of agents, one pattern is wrapping a handoff in a tool call, e.g.:
+
+```python
+@tool
+def transfer_to_bob(state):
+    """Transfer to bob."""
+    return Command(
+        goto="bob",
+        update={"my_state_key": "my_state_value"},
+        # Each tool-calling agent is implemented as a subgraph.
+        # As a result, to navigate to another agent (a sibling sub-graph), 
+        # we need to specify that navigation is w/ respect to the parent graph.
+        graph=Command.PARENT,
+    )
+```
+
+This guide shows how you can:
+
+- implement handoffs using `Command`: agent node makes a decision on who to hand off to (usually LLM-based), and explicitly returns a handoff via `Command`. These are useful when you need fine-grained control over how an agent routes to another agent. It could be well suited for implementing a supervisor agent in a supervisor architecture.
+- implement handoffs using tools: a tool-calling agent has access to tools that can return a handoff via `Command`. The tool-executing node in the agent recognizes `Command` objects returned by the tools and routes accordingly. Handoff tool a general-purpose primitive that is useful in any multi-agent systems that contain tool-calling agents.
+## Setup
+%%capture --no-stderr
+%pip install -U langgraph langchain-anthropic
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Implement handoffs using `Command`
+Let's implement a system with two agents:
+
+- an addition expert (can only add numbers)
+- a multiplication expert (can only multiply numbers).
+
+In this example the agents will be relying on the LLM for doing math. In a more realistic [follow-up example](#using-with-a-custom-agent), we will give the agents tools for doing math.
+
+When the addition expert needs help with multiplication, it hands off to the multiplication expert and vice-versa. This is an example of a simple multi-agent network.
+
+Each agent will have a corresponding node function that can conditionally return a `Command` object (e.g. our handoff). The node function will use an LLM with a system prompt and a tool that lets it signal when it needs to hand off to another agent. If the LLM responds with the tool calls, we will return a `Command(goto=<other_agent>)`.
+
+> **Note**: while we're using tools for the LLM to signal that it needs a handoff, the condition for the handoff can be anything: a specific response text from the LLM, structured output from the LLM, any other custom logic, etc.
+from typing_extensions import Literal
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.types import Command
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+
+@tool
+def transfer_to_multiplication_expert():
+    """Ask multiplication agent for help."""
+    # This tool is not returning anything: we're just using it
+    # as a way for LLM to signal that it needs to hand off to another agent
+    # (See the paragraph above)
+    return
+
+
+@tool
+def transfer_to_addition_expert():
+    """Ask addition agent for help."""
+    return
+
+
+def addition_expert(
+    state: MessagesState,
+) -> Command[Literal["multiplication_expert", "__end__"]]:
+    system_prompt = (
+        "You are an addition expert, you can ask the multiplication expert for help with multiplication. "
+        "Always do your portion of calculation before the handoff."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    ai_msg = model.bind_tools([transfer_to_multiplication_expert]).invoke(messages)
+    # If there are tool calls, the LLM needs to hand off to another agent
+    if len(ai_msg.tool_calls) > 0:
+        tool_call_id = ai_msg.tool_calls[-1]["id"]
+        # NOTE: it's important to insert a tool message here because LLM providers are expecting
+        # all AI messages to be followed by a corresponding tool result message
+        tool_msg = {
+            "role": "tool",
+            "content": "Successfully transferred",
+            "tool_call_id": tool_call_id,
+        }
+        return Command(
+            goto="multiplication_expert", update={"messages": [ai_msg, tool_msg]}
+        )
+
+    # If the expert has an answer, return it directly to the user
+    return {"messages": [ai_msg]}
+
+
+def multiplication_expert(
+    state: MessagesState,
+) -> Command[Literal["addition_expert", "__end__"]]:
+    system_prompt = (
+        "You are a multiplication expert, you can ask an addition expert for help with addition. "
+        "Always do your portion of calculation before the handoff."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    ai_msg = model.bind_tools([transfer_to_addition_expert]).invoke(messages)
+    if len(ai_msg.tool_calls) > 0:
+        tool_call_id = ai_msg.tool_calls[-1]["id"]
+        tool_msg = {
+            "role": "tool",
+            "content": "Successfully transferred",
+            "tool_call_id": tool_call_id,
+        }
+        return Command(goto="addition_expert", update={"messages": [ai_msg, tool_msg]})
+
+    return {"messages": [ai_msg]}
+Let's now combine both of these nodes into a single graph. Note that there are no edges between the agents! If the expert has an answer, it will return it directly to the user, otherwise it will route to the other expert for help.
+builder = StateGraph(MessagesState)
+builder.add_node("addition_expert", addition_expert)
+builder.add_node("multiplication_expert", multiplication_expert)
+# we'll always start with the addition expert
+builder.add_edge(START, "addition_expert")
+graph = builder.compile()
+Finally, let's define a helper function to render the streamed outputs nicely:
+from langchain_core.messages import convert_to_messages
+
+
+def pretty_print_messages(update):
+    if isinstance(update, tuple):
+        ns, update = update
+        # skip parent graph updates in the printouts
+        if len(ns) == 0:
+            return
+
+        graph_id = ns[-1].split(":")[0]
+        print(f"Update from subgraph {graph_id}:")
+        print("\n")
+
+    for node_name, node_update in update.items():
+        print(f"Update from node {node_name}:")
+        print("\n")
+
+        for m in convert_to_messages(node_update["messages"]):
+            m.pretty_print()
+        print("\n")
+Let's run the graph with an expression that requires both addition and multiplication:
+for chunk in graph.stream(
+    {"messages": [("user", "what's (3 + 5) * 12")]},
+):
+    pretty_print_messages(chunk)
+You can see that the addition expert first handled the expression in the parentheses, and then handed off to the multiplication expert to finish the calculation.
+
+Now let's see how we can implement this same system using special handoff tools and give our agents actual math tools.
+## Implement handoffs using tools
+### Implement a handoff tool
+In the previous example we explicitly defined custom handoffs in each of the agent nodes. Another pattern is to create special **handoff tools** that directly return `Command` objects. When an agent calls a tool like this, it hands the control off to a different agent. Specifically, the tool-executing node in the agent recognizes the `Command` objects returned by the tools and routes control flow accordingly. **Note**: unlike the previous example, a tool-calling agent is not a single node but another graph that can be added to the multi-agent graph as a subgraph node.
+
+There are a few important considerations when implementing handoff tools:
+
+- since each agent is a __subgraph__ node in another graph, and the tools will be called in one of the agent subgraph nodes (e.g. tool executor), we need to specify `graph=Command.PARENT` in the `Command`, so that LangGraph knows to navigate outside of the agent subgraph
+- we can optionally specify a state update that will be applied to the parent graph state before the next agent is called
+    - these state updates can be used to control [how much of the chat message history](../../concepts/multi_agent#shared-message-list) the target agent sees. For example, you might choose to just share the last AI messages from the current agent, or its full internal chat history, etc. In the examples below we'll be sharing the full internal chat history.
+
+- we can optionally provide the following to the tool (in the tool function signature):
+    - graph state (using [`InjectedState`][langgraph.prebuilt.tool_node.InjectedState])
+    - graph long-term memory (using [`InjectedStore`][langgraph.prebuilt.tool_node.InjectedStore])
+    - the current tool call ID (using [`InjectedToolCallId`](https://python.langchain.com/api_reference/core/tools/langchain_core.tools.base.InjectedToolCallId.html))
+      
+    These are not necessary but are useful for creating the state update passed to the next agent.
+from typing import Annotated
+
+from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+
+
+def make_handoff_tool(*, agent_name: str):
+    """Create a tool that can return handoff via a Command"""
+    tool_name = f"transfer_to_{agent_name}"
+
+    @tool(tool_name)
+    def handoff_to_agent(
+        # # optionally pass current graph state to the tool (will be ignored by the LLM)
+        state: Annotated[dict, InjectedState],
+        # optionally pass the current tool call ID (will be ignored by the LLM)
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ):
+        """Ask another agent for help."""
+        tool_message = {
+            "role": "tool",
+            "content": f"Successfully transferred to {agent_name}",
+            "name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+        return Command(
+            # navigate to another agent node in the PARENT graph
+            goto=agent_name,
+            graph=Command.PARENT,
+            # This is the state update that the agent `agent_name` will see when it is invoked.
+            # We're passing agent's FULL internal message history AND adding a tool message to make sure
+            # the resulting chat history is valid. See the paragraph above for more information.
+            update={"messages": state["messages"] + [tool_message]},
+        )
+
+    return handoff_to_agent
+### Using with a custom agent
+To demonstrate how to use handoff tools, let's first implement a simple version of the prebuilt [create_react_agent][langgraph.prebuilt.chat_agent_executor.create_react_agent]. This is useful in case you want to have a custom tool-calling agent implementation and want to leverage handoff tools.
+from typing_extensions import Literal
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.types import Command
+
+
+def make_agent(model, tools, system_prompt=None):
+    model_with_tools = model.bind_tools(tools)
+    tools_by_name = {tool.name: tool for tool in tools}
+
+    def call_model(state: MessagesState) -> Command[Literal["call_tools", "__end__"]]:
+        messages = state["messages"]
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
+
+        response = model_with_tools.invoke(messages)
+        if len(response.tool_calls) > 0:
+            return Command(goto="call_tools", update={"messages": [response]})
+
+        return {"messages": [response]}
+
+    # NOTE: this is a simplified version of the prebuilt ToolNode
+    # If you want to have a tool node that has full feature parity, please refer to the source code
+    def call_tools(state: MessagesState) -> Command[Literal["call_model"]]:
+        tool_calls = state["messages"][-1].tool_calls
+        results = []
+        for tool_call in tool_calls:
+            tool_ = tools_by_name[tool_call["name"]]
+            tool_input_fields = tool_.get_input_schema().model_json_schema()[
+                "properties"
+            ]
+
+            # this is simplified for demonstration purposes and
+            # is different from the ToolNode implementation
+            if "state" in tool_input_fields:
+                # inject state
+                tool_call = {**tool_call, "args": {**tool_call["args"], "state": state}}
+
+            tool_response = tool_.invoke(tool_call)
+            if isinstance(tool_response, ToolMessage):
+                results.append(Command(update={"messages": [tool_response]}))
+
+            # handle tools that return Command directly
+            elif isinstance(tool_response, Command):
+                results.append(tool_response)
+
+        # NOTE: nodes in LangGraph allow you to return list of updates, including Command objects
+        return results
+
+    graph = StateGraph(MessagesState)
+    graph.add_node(call_model)
+    graph.add_node(call_tools)
+    graph.add_edge(START, "call_model")
+    graph.add_edge("call_tools", "call_model")
+
+    return graph.compile()
+Let's also define math tools that we'll give our agents:
+@tool
+def add(a: int, b: int) -> int:
+    """Adds two numbers."""
+    return a + b
+
+
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiplies two numbers."""
+    return a * b
+Let's test the agent implementation out to make sure it's working as expected:
+agent = make_agent(model, [add, multiply])
+
+for chunk in agent.stream({"messages": [("user", "what's (3 + 5) * 12")]}):
+    pretty_print_messages(chunk)
+Now, we can implement our multi-agent system with the multiplication and addition expert agents. This time we'll give them the tools for doing math, as well as our special handoff tools:
+addition_expert = make_agent(
+    model,
+    [add, make_handoff_tool(agent_name="multiplication_expert")],
+    system_prompt="You are an addition expert, you can ask the multiplication expert for help with multiplication.",
+)
+multiplication_expert = make_agent(
+    model,
+    [multiply, make_handoff_tool(agent_name="addition_expert")],
+    system_prompt="You are a multiplication expert, you can ask an addition expert for help with addition.",
+)
+
+builder = StateGraph(MessagesState)
+builder.add_node("addition_expert", addition_expert)
+builder.add_node("multiplication_expert", multiplication_expert)
+builder.add_edge(START, "addition_expert")
+graph = builder.compile()
+Let's run the graph with the same multi-step calculation input as before:
+for chunk in graph.stream(
+    {"messages": [("user", "what's (3 + 5) * 12")]}, subgraphs=True
+):
+    pretty_print_messages(chunk)
+We can see that after the addition expert is done with the first part of the calculation (after calling the `add` tool), it decides to hand off to the multiplication expert, which computes the final result.
+## Using with a prebuilt ReAct agent
+If you don't need extra customization, you can use the prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent], which includes built-in support for handoff tools through [`ToolNode`][langgraph.prebuilt.tool_node.ToolNode].
+from langgraph.prebuilt import create_react_agent
+
+addition_expert = create_react_agent(
+    model,
+    [add, make_handoff_tool(agent_name="multiplication_expert")],
+    prompt="You are an addition expert, you can ask the multiplication expert for help with multiplication.",
+)
+
+multiplication_expert = create_react_agent(
+    model,
+    [multiply, make_handoff_tool(agent_name="addition_expert")],
+    prompt="You are a multiplication expert, you can ask an addition expert for help with addition.",
+)
+
+builder = StateGraph(MessagesState)
+builder.add_node("addition_expert", addition_expert)
+builder.add_node("multiplication_expert", multiplication_expert)
+builder.add_edge(START, "addition_expert")
+graph = builder.compile()
+We can now verify that the prebuilt ReAct agent works exactly the same as the custom agent above:
+for chunk in graph.stream(
+    {"messages": [("user", "what's (3 + 5) * 12")]}, subgraphs=True
+):
+    pretty_print_messages(chunk)
+
+
+# How to add multi-turn conversation in a multi-agent application
+
+!!! info "Prerequisites"
+    This guide assumes familiarity with the following:
+
+    - [How to implement handoffs between agents](../agent-handoffs)
+    - [Multi-agent systems](../../concepts/multi_agent)
+    - [Human-in-the-loop](../../concepts/human_in_the_loop)
+    - [Command](../../concepts/low_level/#command)
+    - [LangGraph Glossary](../../concepts/low_level/)
+
+
+In this how-to guide, we’ll build an application that allows an end-user to engage in a *multi-turn conversation* with one or more agents. We'll create a node that uses an [`interrupt`](../../reference/types/#langgraph.types.interrupt) to collect user input and routes back to the **active** agent.
+
+The agents will be implemented as nodes in a graph that executes agent steps and determines the next action:  
+
+1. **Wait for user input** to continue the conversation, or  
+2. **Route to another agent** (or back to itself, such as in a loop) via a [**handoff**](../../concepts/multi_agent/#handoffs).
+
+```python
+def human(state: MessagesState) -> Command[Literal["agent", "another_agent"]]:
+    """A node for collecting user input."""
+    user_input = interrupt(value="Ready for user input.")
+
+    # Determine the active agent.
+    active_agent = ...
+
+    ...
+    return Command(
+        update={
+            "messages": [{
+                "role": "human",
+                "content": user_input,
+            }]
+        },
+        goto=active_agent
+    )
+
+def agent(state) -> Command[Literal["agent", "another_agent", "human"]]:
+    # The condition for routing/halting can be anything, e.g. LLM tool call / structured output, etc.
+    goto = get_next_agent(...)  # 'agent' / 'another_agent'
+    if goto:
+        return Command(goto=goto, update={"my_state_key": "my_state_value"})
+    else:
+        return Command(goto="human") # Go to human node
+```
+## Setup
+
+First, let's install the required packages
+%%capture --no-stderr
+%pip install -U langgraph langchain-anthropic
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Define agents
+
+In this example, we will build a team of travel assistant agents that can communicate with each other via handoffs.
+
+We will create 2 agents:
+
+* `travel_advisor`: can help with travel destination recommendations. Can ask `hotel_advisor` for help.
+* `hotel_advisor`: can help with hotel recommendations. Can ask `travel_advisor` for help.
+
+We will be using prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent] for the agents - each agent will have tools specific to its area of expertise as well as a special [tool for handoffs](../agent-handoffs#implementing-handoffs-using-tools) to another agent.
+
+First, let's define the tools we'll be using:
+import random
+from typing import Annotated, Literal
+
+from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+
+
+@tool
+def get_travel_recommendations():
+    """Get recommendation for travel destinations"""
+    return random.choice(["aruba", "turks and caicos"])
+
+
+@tool
+def get_hotel_recommendations(location: Literal["aruba", "turks and caicos"]):
+    """Get hotel recommendations for a given destination."""
+    return {
+        "aruba": [
+            "The Ritz-Carlton, Aruba (Palm Beach)"
+            "Bucuti & Tara Beach Resort (Eagle Beach)"
+        ],
+        "turks and caicos": ["Grace Bay Club", "COMO Parrot Cay"],
+    }[location]
+
+
+def make_handoff_tool(*, agent_name: str):
+    """Create a tool that can return handoff via a Command"""
+    tool_name = f"transfer_to_{agent_name}"
+
+    @tool(tool_name)
+    def handoff_to_agent(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ):
+        """Ask another agent for help."""
+        tool_message = {
+            "role": "tool",
+            "content": f"Successfully transferred to {agent_name}",
+            "name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+        return Command(
+            # navigate to another agent node in the PARENT graph
+            goto=agent_name,
+            graph=Command.PARENT,
+            # This is the state update that the agent `agent_name` will see when it is invoked.
+            # We're passing agent's FULL internal message history AND adding a tool message to make sure
+            # the resulting chat history is valid.
+            update={"messages": state["messages"] + [tool_message]},
+        )
+
+    return handoff_to_agent
+Let's now create our agents using the the prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent]. We'll also define a dedicated `human` node with an [`interrupt`][langgraph.types.interrupt] -- we will route to this node after the final response from the agents. Note that to do so we're wrapping each agent invocation in a separate node function that returns `Command(goto="human", ...)`.
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.prebuilt import create_react_agent, InjectedState
+from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import MemorySaver
+
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+# Define travel advisor tools and ReAct agent
+travel_advisor_tools = [
+    get_travel_recommendations,
+    make_handoff_tool(agent_name="hotel_advisor"),
+]
+travel_advisor = create_react_agent(
+    model,
+    travel_advisor_tools,
+    prompt=(
+        "You are a general travel expert that can recommend travel destinations (e.g. countries, cities, etc). "
+        "If you need hotel recommendations, ask 'hotel_advisor' for help. "
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+def call_travel_advisor(
+    state: MessagesState,
+) -> Command[Literal["hotel_advisor", "human"]]:
+    # You can also add additional logic like changing the input to the agent / output from the agent, etc.
+    # NOTE: we're invoking the ReAct agent with the full history of messages in the state
+    response = travel_advisor.invoke(state)
+    return Command(update=response, goto="human")
+
+
+# Define hotel advisor tools and ReAct agent
+hotel_advisor_tools = [
+    get_hotel_recommendations,
+    make_handoff_tool(agent_name="travel_advisor"),
+]
+hotel_advisor = create_react_agent(
+    model,
+    hotel_advisor_tools,
+    prompt=(
+        "You are a hotel expert that can provide hotel recommendations for a given destination. "
+        "If you need help picking travel destinations, ask 'travel_advisor' for help."
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+def call_hotel_advisor(
+    state: MessagesState,
+) -> Command[Literal["travel_advisor", "human"]]:
+    response = hotel_advisor.invoke(state)
+    return Command(update=response, goto="human")
+
+
+def human_node(
+    state: MessagesState, config
+) -> Command[Literal["hotel_advisor", "travel_advisor", "human"]]:
+    """A node for collecting user input."""
+
+    user_input = interrupt(value="Ready for user input.")
+
+    # identify the last active agent
+    # (the last active node before returning to human)
+    langgraph_triggers = config["metadata"]["langgraph_triggers"]
+    if len(langgraph_triggers) != 1:
+        raise AssertionError("Expected exactly 1 trigger in human node")
+
+    active_agent = langgraph_triggers[0].split(":")[1]
+
+    return Command(
+        update={
+            "messages": [
+                {
+                    "role": "human",
+                    "content": user_input,
+                }
+            ]
+        },
+        goto=active_agent,
+    )
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("travel_advisor", call_travel_advisor)
+builder.add_node("hotel_advisor", call_hotel_advisor)
+
+# This adds a node to collect human input, which will route
+# back to the active agent.
+builder.add_node("human", human_node)
+
+# We'll always start with a general travel advisor.
+builder.add_edge(START, "travel_advisor")
+
+
+checkpointer = MemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+from IPython.display import display, Image
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+## Test multi-turn conversation
+
+Let's test a multi turn conversation with this application.
+import uuid
+
+thread_config = {"configurable": {"thread_id": uuid.uuid4()}}
+
+inputs = [
+    # 1st round of conversation,
+    {
+        "messages": [
+            {"role": "user", "content": "i wanna go somewhere warm in the caribbean"}
+        ]
+    },
+    # Since we're using `interrupt`, we'll need to resume using the Command primitive.
+    # 2nd round of conversation,
+    Command(
+        resume="could you recommend a nice hotel in one of the areas and tell me which area it is."
+    ),
+    # 3rd round of conversation,
+    Command(
+        resume="i like the first one. could you recommend something to do near the hotel?"
+    ),
+]
+
+for idx, user_input in enumerate(inputs):
+    print()
+    print(f"--- Conversation Turn {idx + 1} ---")
+    print()
+    print(f"User: {user_input}")
+    print()
+    for update in graph.stream(
+        user_input,
+        config=thread_config,
+        stream_mode="updates",
+    ):
+        for node_id, value in update.items():
+            if isinstance(value, dict) and value.get("messages", []):
+                last_message = value["messages"][-1]
+                if isinstance(last_message, dict) or last_message.type != "ai":
+                    continue
+                print(f"{node_id}: {last_message.content}")
+
+# How to build a multi-agent network
+!!! info "Prerequisites" 
+    This guide assumes familiarity with the following:
+
+    - [How to implement handoffs between agents](../agent-handoffs)
+    - [Multi-agent systems](../../concepts/multi_agent)
+    - [Command](../../concepts/low_level/#command)
+    - [LangGraph Glossary](../../concepts/low_level/)
+
+In this how-to guide we will demonstrate how to implement a [multi-agent network](../../concepts/multi_agent#network) architecture where each agent can communicate with every other agent (many-to-many connections) and can decide which agent to call next. Individual agents will be defined as graph nodes.
+
+To implement communication between the agents, we will be using [handoffs](../agent-handoffs):
+
+```python
+def agent(state) -> Command[Literal["agent", "another_agent"]]:
+    # the condition for routing/halting can be anything, e.g. LLM tool call / structured output, etc.
+    goto = get_next_agent(...)  # 'agent' / 'another_agent'
+    return Command(
+        # Specify which agent to call next
+        goto=goto,
+        # Update the graph state
+        update={"my_state_key": "my_state_value"}
+    )
+```
+## Setup
+
+First, let's install the required packages
+%%capture --no-stderr
+%pip install -U langgraph langchain-anthropic
+import getpass
+import os
+
+
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
+
+
+_set_env("ANTHROPIC_API_KEY")
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Using a custom agent implementation
+In this example we will build a team of travel assistant agents that can communicate with each other via handoffs.
+
+We will create 2 agents:
+
+* `travel_advisor`: can help with travel destination recommendations. Can ask `hotel_advisor` for help.
+* `hotel_advisor`: can help with hotel recommendations. Can ask `travel_advisor` for help.
+
+This is a fully-connected network - every agent can talk to any other agent. 
+
+Each agent will have a corresponding node function that can conditionally return a `Command` object (the handoff). The node function will use an LLM with a system prompt and a tool that lets it signal when it needs to hand off to another agent. If the LLM responds with the tool calls, we will return a `Command(goto=<other_agent>)`.
+
+> **Note**: while we're using tools for the LLM to signal that it needs a handoff, the condition for the handoff can be anything: a specific response text from the LLM, structured output from the LLM, any other custom logic, etc.
+
+Now, let's define our agent nodes and graph!
+from typing_extensions import Literal
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.types import Command
+
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+
+# Define a helper for each of the agent nodes to call
+
+
+@tool
+def transfer_to_travel_advisor():
+    """Ask travel advisor for help."""
+    # This tool is not returning anything: we're just using it
+    # as a way for LLM to signal that it needs to hand off to another agent
+    # (See the paragraph above)
+    return
+
+
+@tool
+def transfer_to_hotel_advisor():
+    """Ask hotel advisor for help."""
+    return
+
+
+def travel_advisor(
+    state: MessagesState,
+) -> Command[Literal["hotel_advisor", "__end__"]]:
+    system_prompt = (
+        "You are a general travel expert that can recommend travel destinations (e.g. countries, cities, etc). "
+        "If you need hotel recommendations, ask 'hotel_advisor' for help."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    ai_msg = model.bind_tools([transfer_to_hotel_advisor]).invoke(messages)
+    # If there are tool calls, the LLM needs to hand off to another agent
+    if len(ai_msg.tool_calls) > 0:
+        tool_call_id = ai_msg.tool_calls[-1]["id"]
+        # NOTE: it's important to insert a tool message here because LLM providers are expecting
+        # all AI messages to be followed by a corresponding tool result message
+        tool_msg = {
+            "role": "tool",
+            "content": "Successfully transferred",
+            "tool_call_id": tool_call_id,
+        }
+        return Command(goto="hotel_advisor", update={"messages": [ai_msg, tool_msg]})
+
+    # If the expert has an answer, return it directly to the user
+    return {"messages": [ai_msg]}
+
+
+def hotel_advisor(
+    state: MessagesState,
+) -> Command[Literal["travel_advisor", "__end__"]]:
+    system_prompt = (
+        "You are a hotel expert that can provide hotel recommendations for a given destination. "
+        "If you need help picking travel destinations, ask 'travel_advisor' for help."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+    ai_msg = model.bind_tools([transfer_to_travel_advisor]).invoke(messages)
+    # If there are tool calls, the LLM needs to hand off to another agent
+    if len(ai_msg.tool_calls) > 0:
+        tool_call_id = ai_msg.tool_calls[-1]["id"]
+        # NOTE: it's important to insert a tool message here because LLM providers are expecting
+        # all AI messages to be followed by a corresponding tool result message
+        tool_msg = {
+            "role": "tool",
+            "content": "Successfully transferred",
+            "tool_call_id": tool_call_id,
+        }
+        return Command(goto="travel_advisor", update={"messages": [ai_msg, tool_msg]})
+
+    # If the expert has an answer, return it directly to the user
+    return {"messages": [ai_msg]}
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("travel_advisor", travel_advisor)
+builder.add_node("hotel_advisor", hotel_advisor)
+# we'll always start with a general travel advisor
+builder.add_edge(START, "travel_advisor")
+
+graph = builder.compile()
+
+from IPython.display import display, Image
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+First, let's invoke it with a generic input:
+from langchain_core.messages import convert_to_messages
+
+
+def pretty_print_messages(update):
+    if isinstance(update, tuple):
+        ns, update = update
+        # skip parent graph updates in the printouts
+        if len(ns) == 0:
+            return
+
+        graph_id = ns[-1].split(":")[0]
+        print(f"Update from subgraph {graph_id}:")
+        print("\n")
+
+    for node_name, node_update in update.items():
+        print(f"Update from node {node_name}:")
+        print("\n")
+
+        for m in convert_to_messages(node_update["messages"]):
+            m.pretty_print()
+        print("\n")
+for chunk in graph.stream(
+    {"messages": [("user", "i wanna go somewhere warm in the caribbean")]}
+):
+    pretty_print_messages(chunk)
+You can see that in this case only the first agent (`travel_advisor`) ran. Let's now ask for more recommendations:
+for chunk in graph.stream(
+    {
+        "messages": [
+            (
+                "user",
+                "i wanna go somewhere warm in the caribbean. pick one destination and give me hotel recommendations",
+            )
+        ]
+    }
+):
+    pretty_print_messages(chunk)
+Voila - `travel_advisor` picks a destination and then makes a decision to call `hotel_advisor` for more info!
+## Using with a prebuilt ReAct agent
+Let's now see how we can implement the same team of travel agents, but give each of the agents some tools to call. We'll be using prebuilt [`create_react_agent`][langgraph.prebuilt.chat_agent_executor.create_react_agent] to implement the agents. First, let's create some of the tools that the agents will be using:
+import random
+from typing_extensions import Literal
+
+
+@tool
+def get_travel_recommendations():
+    """Get recommendation for travel destinations"""
+    return random.choice(["aruba", "turks and caicos"])
+
+
+@tool
+def get_hotel_recommendations(location: Literal["aruba", "turks and caicos"]):
+    """Get hotel recommendations for a given destination."""
+    return {
+        "aruba": [
+            "The Ritz-Carlton, Aruba (Palm Beach)"
+            "Bucuti & Tara Beach Resort (Eagle Beach)"
+        ],
+        "turks and caicos": ["Grace Bay Club", "COMO Parrot Cay"],
+    }[location]
+Let's also write a helper to create a handoff tool. See [this how-to guide](../agent-handoffs#implementing-handoffs-using-tools) for a more in-depth walkthrough of how to make a handoff tool.
+from typing import Annotated
+
+from langchain_core.tools import tool
+from langchain_core.tools.base import InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+
+
+def make_handoff_tool(*, agent_name: str):
+    """Create a tool that can return handoff via a Command"""
+    tool_name = f"transfer_to_{agent_name}"
+
+    @tool(tool_name)
+    def handoff_to_agent(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ):
+        """Ask another agent for help."""
+        tool_message = {
+            "role": "tool",
+            "content": f"Successfully transferred to {agent_name}",
+            "name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+        return Command(
+            # navigate to another agent node in the PARENT graph
+            goto=agent_name,
+            graph=Command.PARENT,
+            # This is the state update that the agent `agent_name` will see when it is invoked.
+            # We're passing agent's FULL internal message history AND adding a tool message to make sure
+            # the resulting chat history is valid.
+            update={"messages": state["messages"] + [tool_message]},
+        )
+
+    return handoff_to_agent
+Now let's define our agent nodes and combine them into a graph:
+from langgraph.graph import MessagesState, StateGraph, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Command
+
+
+model = ChatAnthropic(model="claude-3-5-sonnet-latest")
+
+# Define travel advisor ReAct agent
+travel_advisor_tools = [
+    get_travel_recommendations,
+    make_handoff_tool(agent_name="hotel_advisor"),
+]
+travel_advisor = create_react_agent(
+    model,
+    travel_advisor_tools,
+    prompt=(
+        "You are a general travel expert that can recommend travel destinations (e.g. countries, cities, etc). "
+        "If you need hotel recommendations, ask 'hotel_advisor' for help. "
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+def call_travel_advisor(
+    state: MessagesState,
+) -> Command[Literal["hotel_advisor", "__end__"]]:
+    # You can also add additional logic like changing the input to the agent / output from the agent, etc.
+    # NOTE: we're invoking the ReAct agent with the full history of messages in the state
+    return travel_advisor.invoke(state)
+
+
+# Define hotel advisor ReAct agent
+hotel_advisor_tools = [
+    get_hotel_recommendations,
+    make_handoff_tool(agent_name="travel_advisor"),
+]
+hotel_advisor = create_react_agent(
+    model,
+    hotel_advisor_tools,
+    prompt=(
+        "You are a hotel expert that can provide hotel recommendations for a given destination. "
+        "If you need help picking travel destinations, ask 'travel_advisor' for help."
+        "You MUST include human-readable response before transferring to another agent."
+    ),
+)
+
+
+def call_hotel_advisor(
+    state: MessagesState,
+) -> Command[Literal["travel_advisor", "__end__"]]:
+    return hotel_advisor.invoke(state)
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("travel_advisor", call_travel_advisor)
+builder.add_node("hotel_advisor", call_hotel_advisor)
+# we'll always start with a general travel advisor
+builder.add_edge(START, "travel_advisor")
+
+graph = builder.compile()
+display(Image(graph.get_graph().draw_mermaid_png()))
+Let's test it out using the same input as our original multi-agent system:
+for chunk in graph.stream(
+    {
+        "messages": [
+            (
+                "user",
+                "i wanna go somewhere warm in the caribbean. pick one destination and give me hotel recommendations",
+            )
+        ]
+    },
+    subgraphs=True,
+):
+    pretty_print_messages(chunk)
+
+
+
+
+
+# How to use subgraphs
+
+<div class="admonition tip">
+    <p class="admonition-title">Prerequisites</p>
+    <p>
+        This guide assumes familiarity with the following:
+        <ul>
+            <li>            
+                <a href="https://langchain-ai.github.io/langgraph/concepts/low_level/#subgraphs">
+                    Subgraphs
+                </a>
+            </li>
+            <li>            
+                <a href="https://langchain-ai.github.io/langgraph/concepts/low_level/#state">
+                    State
+                </a>
+            </li>
+        </ul>
+    </p>
+</div> 
+
+[Subgraphs](https://langchain-ai.github.io/langgraph/concepts/low_level/#subgraphs) allow you to build complex systems with multiple components that are themselves graphs. A common use case for using subgraphs is building [multi-agent systems](https://langchain-ai.github.io/langgraph/concepts/multi_agent).
+
+The main question when adding subgraphs is how the parent graph and subgraph communicate, i.e. how they pass the [state](https://langchain-ai.github.io/langgraph/concepts/low_level/#state) between each other during the graph execution. There are two scenarios:
+
+* parent graph and subgraph **share schema keys**. In this case, you can [add a node with the compiled subgraph](#add-a-node-with-the-compiled-subgraph)
+* parent graph and subgraph have **different schemas**. In this case, you have to [add a node function that invokes the subgraph](#add-a-node-function-that-invokes-the-subgraph): this is useful when the parent graph and the subgraph have different state schemas and you need to transform state before or after calling the subgraph
+
+Below we show to to add subgraphs for each scenario.
+
+![Screenshot 2024-07-11 at 1.01.28 PM.png](attachment:71516aef-9c00-4730-a676-a54e90cb6472.png)
+## Setup
+
+First, let's install the required packages
+%%capture --no-stderr
+%pip install -U langgraph
+<div class="admonition tip">
+    <p class="admonition-title">Set up <a href="https://smith.langchain.com">LangSmith</a> for LangGraph development</p>
+    <p style="padding-top: 5px;">
+        Sign up for LangSmith to quickly spot issues and improve the performance of your LangGraph projects. LangSmith lets you use trace data to debug, test, and monitor your LLM apps built with LangGraph — read more about how to get started <a href="https://docs.smith.langchain.com">here</a>. 
+    </p>
+</div>
+## Add a node with the compiled subgraph
+
+A common case is for the parent graph and subgraph to communicate over a shared state key (channel). For example, in [multi-agent](https://langchain-ai.github.io/langgraph/concepts/multi_agent) systems, the agents often communicate over a shared [messages](https://langchain-ai.github.io/langgraph/concepts/low_level/#why-use-messages) key.
+
+If your subgraph shares state keys with the parent graph, you can follow these steps to add it to your graph:
+
+1. Define the subgraph workflow (`subgraph_builder` in the example below) and compile it
+2. Pass compiled subgraph to the `.add_node` method when defining the parent graph workflow
+
+Let's take a look at a simple example. 
+from langgraph.graph import START, StateGraph
+from typing import TypedDict
+
+
+# Define subgraph
+class SubgraphState(TypedDict):
+    foo: str  # note that this key is shared with the parent graph state
+    bar: str
+
+
+def subgraph_node_1(state: SubgraphState):
+    return {"bar": "bar"}
+
+
+def subgraph_node_2(state: SubgraphState):
+    # note that this node is using a state key ('bar') that is only available in the subgraph
+    # and is sending update on the shared state key ('foo')
+    return {"foo": state["foo"] + state["bar"]}
+
+
+subgraph_builder = StateGraph(SubgraphState)
+subgraph_builder.add_node(subgraph_node_1)
+subgraph_builder.add_node(subgraph_node_2)
+subgraph_builder.add_edge(START, "subgraph_node_1")
+subgraph_builder.add_edge("subgraph_node_1", "subgraph_node_2")
+subgraph = subgraph_builder.compile()
+
+
+# Define parent graph
+class ParentState(TypedDict):
+    foo: str
+
+
+def node_1(state: ParentState):
+    return {"foo": "hi! " + state["foo"]}
+
+
+builder = StateGraph(ParentState)
+builder.add_node("node_1", node_1)
+# note that we're adding the compiled subgraph as a node to the parent graph
+builder.add_node("node_2", subgraph)
+builder.add_edge(START, "node_1")
+builder.add_edge("node_1", "node_2")
+graph = builder.compile()
+for chunk in graph.stream({"foo": "foo"}):
+    print(chunk)
+You can see that the final output from the parent graph includes the results of subgraph invocation (i.e. string `"bar"`). If you would like to see outputs from the subgraph, you can specify `subgraphs=True` when streaming. See more on streaming from subgraphs in this [how-to guide](https://langchain-ai.github.io/langgraph/how-tos/streaming-subgraphs/#stream-subgraph).
+for chunk in graph.stream({"foo": "foo"}, subgraphs=True):
+    print(chunk)
+## Add a node function that invokes the subgraph
+
+For more complex systems you might want to define subgraphs that have a completely different schema from the parent graph (no shared keys). For example, in a multi-agent RAG system, a search agent might only need to keep track of queries and retrieved documents.
+
+If that's the case for your application, you need to define a node **function that invokes the subgraph**. This function needs to transform the input (parent) state to the subgraph state before invoking the subgraph, and transform the results back to the parent state before returning the state update from the node.
+
+Below we show how to modify our original example to call a subgraph from inside the node.
+!!! warning
+    You **cannot** invoke more than one subgraph inside the same node.
+# Define subgraph
+class SubgraphState(TypedDict):
+    # note that none of these keys are shared with the parent graph state
+    bar: str
+    baz: str
+
+
+def subgraph_node_1(state: SubgraphState):
+    return {"baz": "baz"}
+
+
+def subgraph_node_2(state: SubgraphState):
+    return {"bar": state["bar"] + state["baz"]}
+
+
+subgraph_builder = StateGraph(SubgraphState)
+subgraph_builder.add_node(subgraph_node_1)
+subgraph_builder.add_node(subgraph_node_2)
+subgraph_builder.add_edge(START, "subgraph_node_1")
+subgraph_builder.add_edge("subgraph_node_1", "subgraph_node_2")
+subgraph = subgraph_builder.compile()
+
+
+# Define parent graph
+class ParentState(TypedDict):
+    foo: str
+
+
+def node_1(state: ParentState):
+    return {"foo": "hi! " + state["foo"]}
+
+
+def node_2(state: ParentState):
+    # transform the state to the subgraph state
+    response = subgraph.invoke({"bar": state["foo"]})
+    # transform response back to the parent state
+    return {"foo": response["bar"]}
+
+
+builder = StateGraph(ParentState)
+builder.add_node("node_1", node_1)
+# note that instead of using the compiled subgraph we are using `node_2` function that is calling the subgraph
+builder.add_node("node_2", node_2)
+builder.add_edge(START, "node_1")
+builder.add_edge("node_1", "node_2")
+graph = builder.compile()
+for chunk in graph.stream({"foo": "foo"}, subgraphs=True):
+    print(chunk)

@@ -1,4 +1,3 @@
-# state.py
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 
@@ -43,14 +42,18 @@ def add_to_extraction_queue(state: ChatState, question_index: int) -> ChatState:
     Add a question index to the term extraction queue after verification.
     
     Args:
-        state: Current state
-        question_index: Index of the question that was verified
+        state: Current state.
+        question_index: Index of the question that was verified.
         
     Returns:
-        Updated ChatState
+        Updated ChatState.
     """
+    print(f"[DEBUG] add_to_extraction_queue called for index: {question_index}")
     if question_index not in state.term_extraction_queue:
         state.term_extraction_queue.append(question_index)
+        print(f"[DEBUG] Added index {question_index} to extraction queue. Current queue: {state.term_extraction_queue}")
+    else:
+        print(f"[DEBUG] Index {question_index} already exists in extraction queue: {state.term_extraction_queue}")
     return state
 
 def get_next_extraction_task(state: ChatState) -> Optional[int]:
@@ -58,27 +61,34 @@ def get_next_extraction_task(state: ChatState) -> Optional[int]:
     Get the next question index that needs term extraction.
     
     Args:
-        state: Current state
+        state: Current state.
         
     Returns:
-        Next question index to process or None if queue is empty
+        Next question index to process or None if the queue is empty.
     """
     if not state.term_extraction_queue:
+        print("[DEBUG] get_next_extraction_task: Extraction queue is empty.")
         return None
-    return state.term_extraction_queue[0]
+    next_index = state.term_extraction_queue[0]
+    print(f"[DEBUG] get_next_extraction_task: Next index to extract is {next_index}.")
+    return next_index
 
 def mark_extraction_complete(state: ChatState, question_index: int) -> ChatState:
     """
     Mark a question as having completed term extraction.
     
     Args:
-        state: Current state
-        question_index: Index of the question that was processed
+        state: Current state.
+        question_index: Index of the question that was processed.
         
     Returns:
-        Updated ChatState
+        Updated ChatState.
     """
+    print(f"[DEBUG] mark_extraction_complete: Marking index {question_index} as complete.")
     if question_index in state.term_extraction_queue:
         state.term_extraction_queue.remove(question_index)
+        print(f"[DEBUG] mark_extraction_complete: Removed index {question_index} from extraction queue. Current queue: {state.term_extraction_queue}")
+    else:
+        print(f"[DEBUG] mark_extraction_complete: Index {question_index} not found in extraction queue: {state.term_extraction_queue}")
     state.last_extracted_index = question_index
     return state
