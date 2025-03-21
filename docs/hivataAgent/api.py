@@ -451,46 +451,25 @@ def get_extracted_terms(session_id: str):
     config = {"configurable": {"thread_id": session_id}}
     
     try:
-        # Get raw states directly
-        parent_state_snapshot = parent_workflow.get_state(config)
-        parent_state = parent_state_snapshot.values if hasattr(parent_state_snapshot, "values") else None
+        # Get the debug information which we know works
+        debug_info = debug_session(session_id)
         
-        extract_state_snapshot = term_extraction_workflow.get_state(config)
-        extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else None
-        
-        # Check if we got valid state objects
-        if parent_state is not None and extract_state is not None:
-            # Access attributes directly if they're ChatState objects, or as dict if they're dicts
-            if hasattr(extract_state, "term_extraction_queue"):
-                queue_length = len(extract_state.term_extraction_queue)
-                extracted_terms = extract_state.extracted_terms
-            else:
-                queue_length = len(extract_state.get("term_extraction_queue", []))
-                extracted_terms = extract_state.get("extracted_terms", {})
-                
-            if hasattr(parent_state, "current_question_index"):
-                current_index = parent_state.current_question_index
-                is_complete = parent_state.is_complete
-            else:
-                current_index = parent_state.get("current_question_index", 0)
-                is_complete = parent_state.get("is_complete", False)
-        else:
-            queue_length = 0
-            extracted_terms = {}
-            current_index = 0
-            is_complete = False
+        # Extract the terms directly from the debug info
+        extracted_terms = debug_info.get("extracted_terms", {})
+        current_index = debug_info.get("current_index", 0)
+        is_complete = debug_info.get("is_complete", False)
+        extraction_queue = debug_info.get("extraction_queue", [])
         
         return {
             "extracted_terms": extracted_terms,
             "current_index": current_index,
             "is_complete": is_complete,
-            "extraction_queue_length": queue_length
+            "extraction_queue_length": len(extraction_queue)
         }
     except Exception as e:
         import traceback
         print(f"Error retrieving extracted terms: {str(e)}")
         print(traceback.format_exc())
-        # Return empty results instead of throwing an error
         return {
             "extracted_terms": {},
             "current_index": 0,

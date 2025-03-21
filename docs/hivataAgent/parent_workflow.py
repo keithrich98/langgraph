@@ -2,6 +2,7 @@
 
 import os
 import time
+import json
 from typing import Dict, List, Any, Optional
 from langgraph.func import entrypoint, task
 from langgraph.checkpoint.memory import MemorySaver
@@ -12,15 +13,13 @@ from state import ChatState, get_next_extraction_task
 
 # Import the agent workflows
 from question_answer import question_answer_workflow
-from term_extractor import term_extraction_workflow
+from term_extractor import term_extraction_workflow, extraction_prompt, llm
 
 # Define the main checkpointer for the parent workflow
 parent_memory = MemorySaver()
 
-# Fix in parent_workflow.py
 @task
 def process_term_extraction(state: ChatState, *, config: Optional[RunnableConfig] = None) -> ChatState:
-    # Note the asterisk (*) making config keyword-only
     """
     Task to process items in the term extraction queue.
     
@@ -85,9 +84,71 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
             state.verified_answers = qa_result.verified_answers
             state.term_extraction_queue = qa_result.term_extraction_queue
         
-        # Automatically process term extraction if there are items in the queue
-        if state.term_extraction_queue:
-            state = process_term_extraction(state).result()
+        # Direct extraction approach instead of using the task
+        if state.verified_answers:
+            extracted_terms = {}
+            for idx, answer_data in state.verified_answers.items():
+                # Skip already processed items
+                if idx in state.extracted_terms:
+                    continue
+                    
+                question = answer_data.get("question", "")
+                answer = answer_data.get("answer", "")
+                
+                # Format the prompt and extract terms
+                formatted_prompt = extraction_prompt.format(
+                    question=question,
+                    answer=answer
+                )
+                
+                print(f"Directly extracting terms for question {idx}: {question[:50]}...")
+                
+                # Use the LLM directly
+                response = llm.invoke(formatted_prompt)
+                content = response.content
+                
+                # Parse the results (same parsing as in direct-extract)
+                try:
+                    # Clean up the JSON response
+                    content = content.strip()
+                    if not content.startswith('['):
+                        start_idx = content.find('[')
+                        if start_idx >= 0:
+                            content = content[start_idx:]
+                            bracket_count = 0
+                            for i, char in enumerate(content):
+                                if char == '[':
+                                    bracket_count += 1
+                                elif char == ']':
+                                    bracket_count -= 1
+                                    if bracket_count == 0:
+                                        content = content[:i+1]
+                                        break
+                    
+                    terms = json.loads(content)
+                    if isinstance(terms, list):
+                        extracted_terms[idx] = terms
+                        print(f"Extracted {len(terms)} terms for question {idx}")
+                except Exception as e:
+                    print(f"Error extracting terms: {str(e)}")
+                    # Fallback approach
+                    lines = content.split('\n')
+                    terms = []
+                    for line in lines:
+                        line = line.strip()
+                        if line and line.startswith('-'):
+                            terms.append(line[1:].strip())
+                        elif line and line.startswith('"') and line.endswith('"'):
+                            terms.append(line.strip('"'))
+                    
+                    extracted_terms[idx] = terms if terms else ["Error parsing terms"]
+                    print(f"Fallback extraction: {len(extracted_terms[idx])} terms for question {idx}")
+            
+            # Update the extracted terms in the state
+            if not hasattr(state, "extracted_terms") or state.extracted_terms is None:
+                state.extracted_terms = {}
+            state.extracted_terms.update(extracted_terms)
+            print(f"Updated state with {len(extracted_terms)} sets of extracted terms")
     
     elif action.get("action") == "extract_terms":
         # Manually trigger term extraction
@@ -108,7 +169,6 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     return state
 
 # Helper function to get the full combined state with all extracted terms
-# Fix in parent_workflow.py
 def get_full_state(thread_id: str) -> Dict:
     """
     Get the full combined state for both agents.
@@ -130,13 +190,28 @@ def get_full_state(thread_id: str) -> Dict:
         extract_state_snapshot = term_extraction_workflow.get_state(config)
         extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else {}
         
+        # Extract terms could be in either parent state or extraction state
+        extracted_terms = {}
+        
+        # Check parent state first
+        if hasattr(parent_state, "extracted_terms") and parent_state.extracted_terms:
+            extracted_terms.update(parent_state.extracted_terms)
+        elif isinstance(parent_state, dict) and parent_state.get("extracted_terms"):
+            extracted_terms.update(parent_state.get("extracted_terms", {}))
+            
+        # Then check extraction state
+        if hasattr(extract_state, "extracted_terms") and extract_state.extracted_terms:
+            extracted_terms.update(extract_state.extracted_terms)
+        elif isinstance(extract_state, dict) and extract_state.get("extracted_terms"):
+            extracted_terms.update(extract_state.get("extracted_terms", {}))
+            
         # Combine the states
         result = {
-            "current_index": parent_state.get("current_question_index", 0),
-            "is_complete": parent_state.get("is_complete", False),
-            "conversation_history": parent_state.get("conversation_history", []),
-            "responses": parent_state.get("responses", {}),
-            "extracted_terms": extract_state.get("extracted_terms", {})
+            "current_index": parent_state.current_question_index if hasattr(parent_state, "current_question_index") else parent_state.get("current_question_index", 0),
+            "is_complete": parent_state.is_complete if hasattr(parent_state, "is_complete") else parent_state.get("is_complete", False),
+            "conversation_history": parent_state.conversation_history if hasattr(parent_state, "conversation_history") else parent_state.get("conversation_history", []),
+            "responses": parent_state.responses if hasattr(parent_state, "responses") else parent_state.get("responses", {}),
+            "extracted_terms": extracted_terms
         }
         
         return result
@@ -152,5 +227,3 @@ def get_full_state(thread_id: str) -> Dict:
             "responses": {},
             "extracted_terms": {}
         }
-    
-    return result
