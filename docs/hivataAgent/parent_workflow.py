@@ -17,15 +17,16 @@ from term_extractor import term_extraction_workflow
 # Define the main checkpointer for the parent workflow
 parent_memory = MemorySaver()
 
+# Fix in parent_workflow.py
 @task
-def process_term_extraction(state: ChatState, config: Optional[RunnableConfig] = None) -> ChatState:
+def process_term_extraction(state: ChatState, *, config: Optional[RunnableConfig] = None) -> ChatState:
+    # Note the asterisk (*) making config keyword-only
     """
     Task to process items in the term extraction queue.
-    This runs the term extraction workflow for each item in the queue.
     
     Args:
         state: The current state
-        config: Optional runtime configuration
+        config: Optional runtime configuration (now using keyword-only parameter)
         
     Returns:
         Updated state after term extraction
@@ -36,7 +37,6 @@ def process_term_extraction(state: ChatState, config: Optional[RunnableConfig] =
         
         # Process the next item in the queue
         # We only process one item at a time to ensure sequential processing
-        # Pass the exact same config to ensure thread_id consistency
         extraction_result = term_extraction_workflow.invoke(
             {"action": "process"}, 
             config=config  # Pass the parent config to maintain thread_id consistency
@@ -87,11 +87,11 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
         
         # Automatically process term extraction if there are items in the queue
         if state.term_extraction_queue:
-            state = process_term_extraction(state, config).result()
+            state = process_term_extraction(state).result()
     
     elif action.get("action") == "extract_terms":
         # Manually trigger term extraction
-        state = process_term_extraction(state, config).result()
+        state = process_term_extraction(state, config=config).result()
     
     elif action.get("action") == "status":
         # Get combined status of both agents
@@ -108,6 +108,7 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     return state
 
 # Helper function to get the full combined state with all extracted terms
+# Fix in parent_workflow.py
 def get_full_state(thread_id: str) -> Dict:
     """
     Get the full combined state for both agents.
@@ -120,19 +121,36 @@ def get_full_state(thread_id: str) -> Dict:
     """
     config = {"configurable": {"thread_id": thread_id}}
     
-    # Get the parent state
-    parent_state = parent_workflow.get_state(config)
-    
-    # Get term extraction state for complete term information
-    extract_state = term_extraction_workflow.get_state(config)
-    
-    # Combine the states
-    result = {
-        "current_index": parent_state.current_question_index if parent_state else 0,
-        "is_complete": parent_state.is_complete if parent_state else False,
-        "conversation_history": parent_state.conversation_history if parent_state else [],
-        "responses": parent_state.responses if parent_state else {},
-        "extracted_terms": extract_state.extracted_terms if extract_state else {}
-    }
+    try:
+        # Get the parent state
+        parent_state_snapshot = parent_workflow.get_state(config)
+        parent_state = parent_state_snapshot.values if hasattr(parent_state_snapshot, "values") else {}
+        
+        # Get term extraction state for complete term information
+        extract_state_snapshot = term_extraction_workflow.get_state(config)
+        extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else {}
+        
+        # Combine the states
+        result = {
+            "current_index": parent_state.get("current_question_index", 0),
+            "is_complete": parent_state.get("is_complete", False),
+            "conversation_history": parent_state.get("conversation_history", []),
+            "responses": parent_state.get("responses", {}),
+            "extracted_terms": extract_state.get("extracted_terms", {})
+        }
+        
+        return result
+    except Exception as e:
+        import traceback
+        print(f"Error in get_full_state: {str(e)}")
+        print(traceback.format_exc())
+        return {
+            "error": str(e),
+            "current_index": 0,
+            "is_complete": False,
+            "conversation_history": [],
+            "responses": {},
+            "extracted_terms": {}
+        }
     
     return result
