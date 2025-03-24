@@ -2,6 +2,7 @@
 
 import os
 import time
+import threading
 from typing import Dict, List, Any, Optional
 from langgraph.func import entrypoint, task
 from langgraph.checkpoint.memory import MemorySaver
@@ -14,41 +15,9 @@ from state import ChatState, get_next_extraction_task
 from question_answer import question_answer_workflow
 from term_extractor import term_extraction_workflow
 
-# Define the main checkpointer for the parent workflow
+# Define the main checkpointer for the parent workflow.
+# This checkpointer is used to persist the parent state between invocations.
 parent_memory = MemorySaver()
-
-# ------------------------
-# Updated Extraction Task
-# ------------------------
-@task
-def process_term_extraction(state: ChatState, *, config: Optional[RunnableConfig] = None) -> ChatState:
-    """
-    Task to process one item from the term extraction queue.
-    
-    Args:
-        state: The current state
-        config: Optional runtime configuration (passed as keyword-only)
-        
-    Returns:
-        Updated state after term extraction.
-    """
-    print(f"[DEBUG Extraction] process_term_extraction invoked. Current extraction queue: {state.term_extraction_queue}")
-    if state.term_extraction_queue:
-        print(f"[DEBUG Extraction] Extraction queue before processing: {state.term_extraction_queue}")
-        extraction_result = term_extraction_workflow.invoke(
-            {"action": "process", "state": state},  # Pass the parent's state in the payload
-            config=config
-        )
-        print(f"[DEBUG Extraction] Extraction workflow returned state with queue: {extraction_result.term_extraction_queue} and extracted_terms: {extraction_result.extracted_terms}")
-        if extraction_result:
-            state.term_extraction_queue = extraction_result.term_extraction_queue
-            state.extracted_terms = extraction_result.extracted_terms
-            state.last_extracted_index = extraction_result.last_extracted_index
-            print(f"[DEBUG Extraction] Merged state in process_term_extraction: extracted_terms: {state.extracted_terms}, queue: {state.term_extraction_queue}")
-    else:
-        print("[DEBUG Extraction] No items in extraction queue to process.")
-    
-    return state
 
 # ------------------------
 # Main Parent Workflow
@@ -56,29 +25,45 @@ def process_term_extraction(state: ChatState, *, config: Optional[RunnableConfig
 @entrypoint(checkpointer=parent_memory)
 def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
     """
-    Main workflow that coordinates the question_answer and term_extraction agents.
+    This is the main workflow that coordinates the question_answer and term_extraction agents.
     
-    Actions:
-      {"action": "start"} - Start a new questionnaire session
-      {"action": "answer", "answer": "user answer"} - Submit an answer to the current question
-      {"action": "extract_terms"} - Manually trigger term extraction for the queue
-      {"action": "status"} - Get the current status of the system
+    The workflow supports multiple actions:
     
-    This workflow automatically triggers term extraction after each valid answer.
+      - {"action": "start"}:
+          * Initialize a new questionnaire session.
+          * The question_answer workflow sends the first question to the human.
+          
+      - {"action": "answer", "answer": "user answer"}:
+          * The human submits an answer.
+          * The question_answer workflow verifies the answer.
+          * If verified, the verified answer is stored in state.verified_answers and its index is added to the term_extraction_queue.
+          * The workflow then triggers term extraction asynchronously in a background thread.
+          
+      - {"action": "extract_terms"}:
+          * Process items in the term extraction queue.
+          
+      - {"action": "status"}:
+          * Retrieve and print the current status from both the question_answer and term_extraction workflows.
+    
+    After the question_answer workflow updates the state with the new answer (and queues it for extraction),
+    if there are items in state.term_extraction_queue, the workflow starts a background thread to handle extraction.
+    This allows the API to return the next question immediately without waiting for term extraction to complete.
     """
-    # Use previous state or initialize a new one
+    # Use previous state or initialize a new one.
     state = previous if previous is not None else ChatState()
     
     if action is None:
-        # No action provided, return current state
+        # If no action is provided, simply return the current state.
         return state
     
     if action.get("action") in ["start", "answer"]:
-        # Forward the action to the question_answer workflow
+        # Forward the action (start or answer) to the question_answer workflow.
         qa_result = question_answer_workflow.invoke(action, config=config)
         
         if qa_result:
-            # Update state fields from the QA workflow results
+            # Update the parent's state with the fields from the question_answer workflow:
+            # This includes the current question index, questions list, conversation history,
+            # responses, completion status, verified answers, and the extraction queue.
             state.current_question_index = qa_result.current_question_index
             state.questions = qa_result.questions if qa_result.questions else state.questions
             state.conversation_history = qa_result.conversation_history
@@ -88,18 +73,46 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
             state.term_extraction_queue = qa_result.term_extraction_queue
             print(f"[DEBUG QA] Updated state from question_answer workflow. Extraction queue: {state.term_extraction_queue}")
         
-        # Automatically process term extraction if items are in the queue
-        if state.term_extraction_queue:
-            print(f"[DEBUG Extraction] Extraction queue before processing: {state.term_extraction_queue}")
-            state = process_term_extraction(state, config=config).result()
+        # For answer actions, trigger term extraction asynchronously if there are items in the queue
+        if action.get("action") == "answer" and state.term_extraction_queue:
+            print(f"[DEBUG Extraction] Triggering async term extraction. Queue: {state.term_extraction_queue}")
+            
+            # Extract just the thread_id from the config, don't try to copy the whole config
+            thread_id = config.get("configurable", {}).get("thread_id") if config else None
+            
+            # Start the extraction in a background thread
+            thread = threading.Thread(
+                target=trigger_extraction_in_thread,
+                args=(thread_id,)
+            )
+            thread.daemon = True  # Set as daemon so it doesn't block program exit
+            thread.start()
     
     elif action.get("action") == "extract_terms":
-        # Manually trigger term extraction, ensuring proper config is passed
-        print("[DEBUG Parent] Manually triggering term extraction.")
-        state = process_term_extraction(state, config=config).result()
+        # This is the action that runs the term extraction
+        print("[DEBUG Parent] Running term extraction.")
+        
+        if state.term_extraction_queue:
+            print(f"[DEBUG Extraction] Processing extraction queue: {state.term_extraction_queue}")
+            # Invoke term_extraction_workflow to process the next item in the queue
+            next_index = get_next_extraction_task(state)
+            if next_index is not None and next_index in state.verified_answers:
+                extraction_result = term_extraction_workflow.invoke(
+                    {"action": "process", "state": state},
+                    config=config
+                )
+                
+                if extraction_result:
+                    # Update extraction-related state fields
+                    state.term_extraction_queue = extraction_result.term_extraction_queue
+                    state.extracted_terms = extraction_result.extracted_terms
+                    state.last_extracted_index = extraction_result.last_extracted_index
+                    print(f"[DEBUG Extraction] Updated state after extraction: queue={state.term_extraction_queue}, extracted_terms keys={list(state.extracted_terms.keys() if state.extracted_terms else [])}")
+        else:
+            print("[DEBUG Extraction] No items in extraction queue to process.")
     
     elif action.get("action") == "status":
-        # Retrieve status information from both workflows
+        # For status, invoke both the question_answer and term_extraction workflows with action "status"
         qa_state = question_answer_workflow.invoke({"action": "status"}, config=config)
         extract_state = term_extraction_workflow.invoke({"action": "status"}, config=config)
         
@@ -111,31 +124,60 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     
     return state
 
+# Add this new function to trigger extraction from a thread
+def trigger_extraction_in_thread(thread_id: Optional[str] = None):
+    """
+    Thread target function that invokes the parent_workflow with the extract_terms action.
+    This properly preserves the LangGraph context.
+    
+    Args:
+        thread_id: The thread ID to use in the config.
+    """
+    try:
+        print(f"[DEBUG Thread] Starting background extraction thread for thread_id: {thread_id}")
+        # Short delay to ensure the main thread has completed its operation
+        time.sleep(0.5)
+        
+        # Create a minimal config with just the thread_id
+        thread_config = {"configurable": {"thread_id": thread_id}} if thread_id else None
+        
+        # Invoke the parent workflow with the extract_terms action
+        parent_workflow.invoke({"action": "extract_terms"}, config=thread_config)
+        print(f"[DEBUG Thread] Extraction completed successfully for thread_id: {thread_id}")
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG Thread] Error in extraction thread: {str(e)}")
+        print(traceback.format_exc())
+
 # ------------------------
 # Helper Function: Combined State
 # ------------------------
 def get_full_state(thread_id: str) -> Dict:
     """
-    Get the full combined state for both agents.
+    Retrieve the full combined state from both the parent workflow and the term extraction workflow.
+    
+    This function uses the parent's checkpoint to get the current state, and separately retrieves
+    the term extraction state (which should have the extracted_terms field updated by the term_extraction_workflow).
+    The two are merged into a single dictionary.
     
     Args:
-        thread_id: The thread ID
+        thread_id: The thread identifier (session id).
         
     Returns:
-        Combined state as a dictionary.
+        A dictionary representing the combined state.
     """
     config = {"configurable": {"thread_id": thread_id}}
     
     try:
-        # Get the parent state
+        # Retrieve the parent state snapshot.
         parent_state_snapshot = parent_workflow.get_state(config)
         parent_state = parent_state_snapshot.values if hasattr(parent_state_snapshot, "values") else {}
         
-        # Get term extraction state for complete term information
+        # Retrieve the term extraction workflow state snapshot.
         extract_state_snapshot = term_extraction_workflow.get_state(config)
         extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else {}
         
-        # Combine the states into a single dictionary
+        # Combine the states into a single dictionary.
         result = {
             "current_index": parent_state.get("current_question_index", 0),
             "is_complete": parent_state.get("is_complete", False),

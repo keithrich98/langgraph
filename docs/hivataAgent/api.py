@@ -204,126 +204,6 @@ def debug_extraction_queue(session_id: str):
         print(traceback.format_exc())
         return {"error": str(e)}
 
-@app.post("/force-extraction/{session_id}")
-def force_extraction(session_id: str):
-    """Force term extraction for verified answers."""
-    config = {"configurable": {"thread_id": session_id}}
-    
-    try:
-        parent_snapshot = parent_workflow.get_state(config)
-        parent_state = parent_snapshot.values if hasattr(parent_snapshot, "values") else None
-        if not parent_state:
-            return {"error": "No parent state found"}
-        
-        verified_answers = getattr(parent_state, "verified_answers", {}) 
-        if not verified_answers:
-            return {"error": "No verified answers found"}
-        
-        from term_extractor import extract_terms
-        results = {}
-        for idx, answer_data in verified_answers.items():
-            question = answer_data.get("question", "")
-            answer = answer_data.get("answer", "")
-            print(f"[DEBUG] Force extraction for question index {idx}: {question[:50]}...")
-            terms = extract_terms(question, answer, config=config).result()
-            results[idx] = terms
-        
-        extract_snapshot = term_extraction_workflow.get_state(config)
-        extract_state = extract_snapshot.values if hasattr(extract_snapshot, "values") else None
-        if extract_state:
-            extract_state.extracted_terms = results
-            extract_state.term_extraction_queue = []
-            extract_state.last_extracted_index = max(verified_answers.keys()) if verified_answers else -1
-            term_extraction_workflow.update_state(config, extract_state)
-        
-        return {
-            "success": True,
-            "extracted_terms": results,
-            "message": "Forced extraction completed"
-        }
-    except Exception as e:
-        import traceback
-        print(f"[DEBUG] Error forcing extraction: {str(e)}")
-        print(traceback.format_exc())
-        return {"error": str(e)}
-
-@app.post("/direct-extract/{session_id}")
-def direct_extract(session_id: str):
-    """Directly extract terms without using the task abstraction."""
-    config = {"configurable": {"thread_id": session_id}}
-    
-    try:
-        parent_snapshot = parent_workflow.get_state(config)
-        parent_state = parent_snapshot.values if hasattr(parent_snapshot, "values") else None
-        if not parent_state:
-            return {"error": "No parent state found"}
-        
-        verified_answers = getattr(parent_state, "verified_answers", {}) 
-        if not verified_answers:
-            return {"error": "No verified answers found"}
-        
-        extract_terms_results = {}
-        for idx, answer_data in verified_answers.items():
-            question = answer_data.get("question", "")
-            answer = answer_data.get("answer", "")
-            print(f"[DEBUG] Direct extraction for Q{idx}: {question[:50]}...")
-            print(f"[DEBUG] Answer: {answer[:50]}...")
-            from term_extractor import extraction_prompt
-            import json
-            formatted_prompt = extraction_prompt.format(question=question, answer=answer)
-            from term_extractor import llm
-            response = llm.invoke(formatted_prompt)
-            content = response.content
-            try:
-                content = content.strip()
-                if not content.startswith('['):
-                    start_idx = content.find('[')
-                    if start_idx >= 0:
-                        content = content[start_idx:]
-                        bracket_count = 0
-                        for i, char in enumerate(content):
-                            if char == '[':
-                                bracket_count += 1
-                            elif char == ']':
-                                bracket_count -= 1
-                                if bracket_count == 0:
-                                    content = content[:i+1]
-                                    break
-                terms = json.loads(content)
-                if isinstance(terms, list):
-                    extract_terms_results[idx] = terms
-                else:
-                    extract_terms_results[idx] = ["ERROR: Expected array of terms"]
-            except Exception as e:
-                print(f"[DEBUG] Error parsing terms: {str(e)}")
-                lines = content.split('\n')
-                terms = []
-                for line in lines:
-                    line = line.strip()
-                    if line and line.startswith('-'):
-                        terms.append(line[1:].strip())
-                    elif line and line.startswith('"') and line.endswith('"'):
-                        terms.append(line.strip('"'))
-                extract_terms_results[idx] = terms if terms else ["ERROR: Failed to extract terms"]
-        
-        extract_snapshot = term_extraction_workflow.get_state(config)
-        extract_state = extract_snapshot.values if hasattr(extract_snapshot, "values") else None
-        if extract_state:
-            if hasattr(extract_state, "extracted_terms"):
-                extract_state.extracted_terms = extract_terms_results
-            else:
-                term_extraction_workflow.update_state(config, {"extracted_terms": extract_terms_results})
-        
-        return {
-            "success": True,
-            "extracted_terms": extract_terms_results,
-            "message": "Direct extraction completed"
-        }
-    except Exception as e:
-        import traceback
-        print(f"[DEBUG] Error in direct extraction: {str(e)}")
-        print(traceback.format_exc())
-        return {"error": str(e)}
 
 @app.get("/extracted-terms/{session_id}")
 def get_extracted_terms(session_id: str):
@@ -334,15 +214,25 @@ def get_extracted_terms(session_id: str):
         parent_state_snapshot = parent_workflow.get_state(config)
         parent_state = parent_state_snapshot.values if hasattr(parent_state_snapshot, "values") else None
         
-        # Log parent's state for debugging
-        print(f"[DEBUG API] Parent state snapshot: {parent_state}")
+        # Also get term extractor state to make sure we have the most recent terms
+        extract_state_snapshot = term_extraction_workflow.get_state(config)
+        extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else None
         
+        # Log states for debugging
+        print(f"[DEBUG API] Parent state snapshot: {parent_state}")
+        print(f"[DEBUG API] Extract state snapshot: {extract_state}")
+        
+        # Get values from parent state
         if parent_state is not None:
-            # Read extracted_terms from the parent's merged state
-            extracted_terms = getattr(parent_state, "extracted_terms", {})
             current_index = getattr(parent_state, "current_question_index", 0)
             is_complete = getattr(parent_state, "is_complete", False)
             queue_length = len(getattr(parent_state, "term_extraction_queue", []))
+            
+            # Get extracted terms, preferring the extraction workflow's state if available
+            if extract_state is not None and hasattr(extract_state, "extracted_terms"):
+                extracted_terms = extract_state.extracted_terms
+            else:
+                extracted_terms = getattr(parent_state, "extracted_terms", {})
         else:
             extracted_terms = {}
             current_index = 0
@@ -358,6 +248,7 @@ def get_extracted_terms(session_id: str):
             "extraction_queue_length": queue_length
         }
     except Exception as e:
+        # Exception handling remains the same
         import traceback
         print(f"[DEBUG API] Error retrieving extracted terms: {str(e)}")
         print(traceback.format_exc())
@@ -368,88 +259,6 @@ def get_extracted_terms(session_id: str):
             "extraction_queue_length": 0,
             "error": str(e)
         }
-
-
-@app.post("/extract-terms/{session_id}")
-def trigger_term_extraction(session_id: str):
-    """Manually trigger term extraction."""
-    config = {"configurable": {"thread_id": session_id}}
-    
-    try:
-        result = parent_workflow.invoke({"action": "extract_terms"}, config=config)
-        extract_snapshot = term_extraction_workflow.get_state(config)
-        extract_state = extract_snapshot.values if hasattr(extract_snapshot, "values") else None
-        if extract_state is not None:
-            if hasattr(extract_state, "term_extraction_queue"):
-                queue_length = len(extract_state.term_extraction_queue)
-                extracted_terms = extract_state.extracted_terms
-            else:
-                queue_length = len(extract_state.get("term_extraction_queue", []))
-                extracted_terms = extract_state.get("extracted_terms", {})
-        else:
-            queue_length = 0
-            extracted_terms = {}
-        
-        return {
-            "success": True,
-            "extraction_queue_length": queue_length,
-            "extracted_terms": extracted_terms,
-            "message": "Term extraction triggered successfully"
-        }
-    except Exception as e:
-        import traceback
-        print(f"[DEBUG] Error triggering term extraction: {str(e)}")
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Error triggering term extraction: {str(e)}")
-
-@app.get("/debug/{session_id}")
-def debug_session(session_id: str):
-    """Retrieve the current session state for overall debugging."""
-    config = {"configurable": {"thread_id": session_id}}
-    try:
-        # Get combined state from the parent workflow
-        combined_state = get_full_state(session_id)
-        
-        # Get detailed state information from parent workflow
-        current_state_snapshot = parent_workflow.get_state(config)
-        if hasattr(current_state_snapshot, "values"):
-            state = current_state_snapshot.values
-            detailed_state = {
-                "current_index": state.current_question_index,
-                "is_complete": state.is_complete,
-                "conversation_history": state.conversation_history,
-                "responses": state.responses,
-                "verified_answers": state.verified_answers,
-                "extraction_queue": state.term_extraction_queue,
-                "last_extracted_index": state.last_extracted_index
-            }
-        else:
-            detailed_state = {}
-        
-        # Get term extraction details
-        extraction_state_snapshot = term_extraction_workflow.get_state(config)
-        if hasattr(extraction_state_snapshot, "values"):
-            extraction_state = extraction_state_snapshot.values
-            extraction_details = {
-                "extraction_queue": extraction_state.term_extraction_queue,
-                "extracted_terms": extraction_state.extracted_terms,
-                "last_extracted_index": extraction_state.last_extracted_index
-            }
-        else:
-            extraction_details = {}
-        
-        debug_info = {
-            "parent_state": detailed_state,
-            "extraction_state": extraction_details,
-            "combined_state": combined_state
-        }
-        print(f"[DEBUG] Debug session info for {session_id}: {json.dumps(debug_info, indent=2)}")
-        return debug_info
-    except Exception as e:
-        import traceback
-        print(f"[DEBUG] Error in debug_session: {str(e)}")
-        print(traceback.format_exc())
-        return {"error": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

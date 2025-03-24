@@ -1,4 +1,5 @@
 # question_answer.py - Modified from graph.py to work in the multi-agent system
+# with hard-coded verification (is_valid always True)
 
 import os
 import json
@@ -12,21 +13,22 @@ from langchain_core.runnables import RunnableConfig
 # Import the shared state and helper functions
 from state import ChatState, add_to_extraction_queue
 
-# Set up the LLM for verification
+# The following LLM setup is still here for structure,
+# but it will not be used in our hard-coded verification.
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from dotenv import load_dotenv
-load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if openai_api_key is None:
-    raise ValueError("OPENAI_API_KEY is not set in your environment.")
-llm = ChatOpenAI(
-    model_name="gpt-4",
-    openai_api_key=openai_api_key,
-    temperature=0  # Lower temperature for more consistent responses
-)
+# load_dotenv()
+# openai_api_key = os.getenv("OPENAI_API_KEY")
+# if openai_api_key is None:
+#     raise ValueError("OPENAI_API_KEY is not set in your environment.")
+# llm = ChatOpenAI(
+#     model_name="gpt-4",
+#     openai_api_key=openai_api_key,
+#     temperature=0  # Lower temperature for more consistent responses
+# )
 
-# Verification result model for function calling
+# Verification result model for function calling (kept for structure)
 class VerificationResult(BaseModel):
     """Tool for verifying if an answer meets medical questionnaire requirements."""
     is_valid: bool = Field(
@@ -42,69 +44,13 @@ class VerificationResult(BaseModel):
 
 def verify_answer(question: Dict[str, Any], answer: str, conversation_history: List[Dict[str, str]], config: Optional[RunnableConfig] = None) -> (bool, str):
     """
-    Uses LangChain function calling with Pydantic models to verify if the answer meets requirements.
-    Returns a tuple of (is_valid, verification_message).
+    Hard-coded verification function. This function always returns that the answer is valid.
+    It keeps the same structure as the original to allow minimal changes in the rest of the workflow.
+    
+    Returns:
+        (True, "Your answer is valid. (Hardcoded verification)")
     """
-    # Format the requirements as bullet points for clarity
-    formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in question['requirements'].items()])
-    
-    # Format the conversation history
-    formatted_history = ""
-    for msg in conversation_history:
-        role = msg['role']
-        content = msg['content']
-        formatted_history += f"{role.upper()}: {content}\n\n"
-    
-    # Create system message
-    system_message = SystemMessage(content=
-        "You are an expert medical validator for a questionnaire about polymicrogyria. "
-        "Your task is to evaluate if a user's answer meets the specified requirements. "
-        "Be thorough but fair in your assessment."
-    )
-    
-    # Create user message with all context
-    user_message = HumanMessage(content=
-        f"QUESTION: {question['text']}\n\n"
-        f"REQUIREMENTS:\n{formatted_requirements}\n\n"
-        f"CONVERSATION HISTORY:\n{formatted_history}\n"
-        f"USER'S ANSWER: {answer}\n\n"
-        f"Evaluate if this answer meets all the requirements. If it's valid, explain why. "
-        f"If it's invalid, specify which requirements weren't met and provide helpful follow-up questions."
-    )
-    
-    # Bind the tool (function) to the LLM 
-    llm_with_verify_tool = llm.bind_tools(
-        tools=[VerificationResult],
-        tool_choice={"type": "function", "function": {"name": "VerificationResult"}}
-    )
-    
-    try:
-        # Invoke the model with function calling
-        response = llm_with_verify_tool.invoke([system_message, user_message], config=config)
-        
-        # Check if we got tool calls
-        if response.tool_calls and len(response.tool_calls) > 0:
-            # Extract the verification result
-            tool_call = response.tool_calls[0]
-            
-            # Use Pydantic to validate and create a proper object
-            result = VerificationResult(**tool_call["args"])
-            
-            # Return the verification result
-            return result.is_valid, result.verification_message
-        
-        # Fallback if no tool calls were made (rare case)
-        if hasattr(response, "content") and response.content:
-            # Try to infer validity from content
-            is_valid = "valid" in response.content.lower() and "not valid" not in response.content.lower()
-            return is_valid, response.content
-            
-        # Ultimate fallback
-        return False, "Unable to verify your answer. Please provide more details."
-        
-    except Exception as e:
-        print(f"Error in verification: {str(e)}")
-        return False, f"There was an error verifying your answer. Please try again with more details."
+    return True, "Your answer is valid. (Hardcoded verification)"
 
 # Questions list
 def get_questions():
@@ -138,11 +84,11 @@ def get_questions():
 # Define a separate checkpointer for the question_answer workflow
 question_answer_memory = MemorySaver()
 
-# The workflow with modifications to work in the multi-agent system
+# The workflow with modifications to work in the multi-agent system.
 @entrypoint(checkpointer=question_answer_memory)
 def question_answer_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
     """
-    A questionnaire workflow with a verification step using LLM function calling.
+    A questionnaire workflow with a hard-coded verification step.
     
     Actions:
       {"action": "start"} - Start a new questionnaire session.
@@ -150,15 +96,15 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
     
     Modified to add verified answers to the extraction queue for the term extractor.
     """
-    # Use previous state or initialize a new one with questions
+    # Use previous state or initialize a new one with questions.
     state = previous if previous is not None else ChatState(questions=get_questions())
     
     if action is None:
-        # No action provided, just return current state
+        # No action provided, just return current state.
         return state
     
     if action.get("action") == "start":
-        # Initialize the session
+        # Initialize the session.
         state.current_question_index = 0
         state.is_complete = False
         state.responses = {}
@@ -167,41 +113,41 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
         state.extracted_terms = {}
         
         question = state.questions[0]
-        # Format requirements as bullet points for better readability
+        # Format requirements as bullet points for better readability.
         formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in question['requirements'].items()])
         prompt = f"{question['text']}\n\nRequirements:\n{formatted_requirements}"
         state.conversation_history = [{"role": "ai", "content": prompt}]
     
     elif action.get("action") == "answer" and not state.is_complete:
         answer = action.get("answer", "")
-        # Append the user's answer to the conversation
+        # Append the user's answer to the conversation.
         state.conversation_history.append({"role": "human", "content": answer})
         
-        # Perform verification using the LLM with function calling
+        # Perform hard-coded verification (always valid).
         current_question = state.questions[state.current_question_index]
         is_valid, verification_message = verify_answer(current_question, answer, state.conversation_history, config)
         
-        # Append the verification message from the LLM to the conversation
+        # Append the verification message from the verification function to the conversation.
         state.conversation_history.append({"role": "ai", "content": verification_message})
         
         if is_valid:
-            # Valid answer: store and move to the next question
+            # Valid answer: store and move to the next question.
             state.responses[state.current_question_index] = answer
             
-            # Add to verified answers for term extraction
+            # Add to verified answers for term extraction.
             state.verified_answers[state.current_question_index] = {
                 "question": current_question["text"],
                 "answer": answer,
                 "verification": verification_message
             }
-            # Debug log for verified answers
+            # Debug log for verified answers.
             print(f"[DEBUG QA] Verified answers: {json.dumps(state.verified_answers, indent=2)}")
             
-            # Ensure the verified answer is added to the extraction queue
+            # Ensure the verified answer is added to the extraction queue.
             state = add_to_extraction_queue(state, state.current_question_index)
             print(f"[DEBUG QA] Extraction queue after adding index {state.current_question_index}: {state.term_extraction_queue}")
             
-            # Move to the next question
+            # Move to the next question.
             state.current_question_index += 1
             if state.current_question_index >= len(state.questions):
                 state.is_complete = True
@@ -210,13 +156,13 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
                     "content": "Thank you for completing all the questions. Your responses have been recorded."
                 })
             else:
-                # Present the next question
+                # Present the next question.
                 next_question = state.questions[state.current_question_index]
                 formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in next_question['requirements'].items()])
                 prompt = f"{next_question['text']}\n\nRequirements:\n{formatted_requirements}"
                 state.conversation_history.append({"role": "ai", "content": prompt})
         else:
-            # If the answer is invalid, the same question remains active for the user to try again.
+            # If the answer is invalid, the same question remains active.
             pass
     
     return state
