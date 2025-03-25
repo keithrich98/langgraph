@@ -70,24 +70,6 @@ def fetch_extracted_terms():
         print(f"Error fetching terms: {str(e)}")
         return None
 
-# Function to trigger term extraction manually
-def trigger_term_extraction():
-    if not st.session_state.session_id:
-        return None
-    
-    try:
-        response = requests.post(f"{API_URL}/extract-terms/{st.session_state.session_id}")
-        if response.status_code == 200:
-            st.success("Term extraction triggered successfully!")
-            # Update our local cache of terms
-            fetch_extracted_terms()
-            return True
-        else:
-            st.error(f"Failed to trigger term extraction. Status code: {response.status_code}")
-            return False
-    except Exception as e:
-        st.error(f"Error triggering term extraction: {str(e)}")
-        return False
 
 # Function to send the user's answer to the API and update the conversation.
 def send_answer(answer: str):
@@ -279,12 +261,6 @@ with right_col:
                 terms_data = fetch_extracted_terms()
                 st.rerun()
             
-            # Add manual extraction trigger
-            if col2.button("Extract Terms Now"):
-                trigger_term_extraction()
-                time.sleep(1)  # Give the system time to process
-                fetch_extracted_terms()
-                st.rerun()
             
             # Auto-refresh checkbox
             if st.checkbox("Auto-refresh every 5 seconds", value=False):
@@ -304,7 +280,7 @@ with right_col:
         
         if st.session_state.session_id:
             if st.button("Get Debug Info"):
-                debug_response = requests.get(f"{API_URL}/debug/{st.session_state.session_id}")
+                debug_response = requests.post(f"{API_URL}/debug-extraction-queue/{st.session_state.session_id}")
                 if debug_response.status_code == 200:
                     st.json(debug_response.json())
                 else:
