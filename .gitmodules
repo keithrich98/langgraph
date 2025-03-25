@@ -1,0 +1,3 @@
+[submodule "langgraph-supervisor-py"]
+	path = langgraph-supervisor-py
+	url = https://github.com/langchain-ai/langgraph-supervisor-py.git
