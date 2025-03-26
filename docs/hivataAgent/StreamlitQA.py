@@ -65,10 +65,10 @@ def fetch_extracted_terms():
             return terms_data
         else:
             print(f"Failed to fetch terms. Status code: {response.status_code}")
-            return None
+            return {"extracted_terms": {}, "error": f"Status code: {response.status_code}"}
     except Exception as e:
         print(f"Error fetching terms: {str(e)}")
-        return None
+        return {"extracted_terms": {}, "error": str(e)}
 
 
 # Function to send the user's answer to the API and update the conversation.
@@ -237,7 +237,7 @@ left_col, right_col = st.columns([2, 1])
 
 # Create tabs on the right column for better organization
 with right_col:
-    tabs = st.tabs(["Medical Terms", "Debug Info"])
+    tabs = st.tabs(["Medical Terms", "Debug Info", "Memory"])
     
     # Medical Terms Tab
     with tabs[0]:
@@ -256,11 +256,9 @@ with right_col:
             display_extracted_terms(terms_data)
             
             # Add manual refresh button
-            col1, col2 = st.columns(2)
-            if col1.button("Refresh Terms"):
+            if st.button("Refresh Terms", use_container_width=True):
                 terms_data = fetch_extracted_terms()
                 st.rerun()
-            
             
             # Auto-refresh checkbox
             if st.checkbox("Auto-refresh every 5 seconds", value=False):
@@ -279,7 +277,7 @@ with right_col:
                         for k, v in st.session_state.items()))
         
         if st.session_state.session_id:
-            if st.button("Get Debug Info"):
+            if st.button("Debug Extraction Queue"):
                 debug_response = requests.post(f"{API_URL}/debug-extraction-queue/{st.session_state.session_id}")
                 if debug_response.status_code == 200:
                     st.json(debug_response.json())
@@ -296,6 +294,60 @@ with right_col:
                 for item in st.session_state.streaming_log:
                     log_text += f"Token #{item['number']}: '{item['token']}'\n"
                 st.code(log_text, language="text")
+    
+    # Memory Tab
+    with tabs[2]:
+        st.subheader("Model Context Inspector")
+        st.write("Inspect what the verification model sees when processing your answers.")
+        
+        if st.session_state.session_id:
+            question_index = st.number_input("Question Index (leave at -1 for current):", 
+                                           min_value=-1, 
+                                           max_value=10, 
+                                           value=-1)
+            
+            if st.button("Inspect Model Context", key="inspect_context_btn"):
+                # Convert -1 to None for API to use current question index
+                idx_param = None if question_index == -1 else question_index
+                context_url = f"{API_URL}/inspect-model-context/{st.session_state.session_id}"
+                if idx_param is not None:
+                    context_url += f"?question_index={idx_param}"
+                    
+                with st.spinner("Retrieving model context..."):
+                    context_response = requests.get(context_url)
+                    if context_response.status_code == 200:
+                        context_data = context_response.json()
+                        
+                        # Create cols for token info display
+                        col1, col2, col3 = st.columns(3)
+                        token_info = context_data.get("token_estimates", {})
+                        
+                        col1.metric("Total Tokens", token_info.get('total_tokens', 'Unknown'))
+                        col2.metric("System Prompt Tokens", token_info.get('system_tokens', 'N/A'))
+                        col3.metric("User Prompt Tokens", token_info.get('user_tokens', 'N/A'))
+                        
+                        # Display system prompt
+                        with st.expander("System Prompt", expanded=False):
+                            st.code(context_data.get("system_prompt", ""), language="text")
+                        
+                        # Display user prompt (with conversation history)
+                        with st.expander("User Prompt (including conversation history)", expanded=True):
+                            st.code(context_data.get("user_prompt", ""), language="text")
+                        
+                        # Show question information
+                        st.subheader("Question Information")
+                        st.markdown(f"**Current Question:** {context_data.get('question', 'Unknown')}")
+                        st.markdown(f"**Question Index:** {context_data.get('current_question_index', 'Unknown')}")
+                        
+                        # Additional state information
+                        with st.expander("Additional State Information", expanded=False):
+                            st.json(context_data.get("state_info", {}))
+                    else:
+                        st.error(f"Failed to get model context. Status code: {context_response.status_code}")
+                        if context_response.text:
+                            st.code(context_response.text, language="text")
+        else:
+            st.info("Start a conversation to inspect the model context.")
 
 # Main interaction area in the left column
 with left_col:

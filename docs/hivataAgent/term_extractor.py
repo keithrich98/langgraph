@@ -8,6 +8,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
 
+# In term_extractor.py
+# Replace the existing term_extraction_memory definition
+from shared_memory import shared_memory
+
+# The entrypoint decorator should remain the same as it will now use the shared memory
+
 # Import the shared state
 from state import ChatState, get_next_extraction_task, mark_extraction_complete
 
@@ -111,14 +117,24 @@ def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] =
         print(f"Error in term extraction: {str(e)}")
         return ["ERROR: Term extraction failed"]
 
-# Define a separate checkpointer for the term extraction workflow
-term_extraction_memory = MemorySaver()
+def debug_state(prefix: str, state: ChatState):
+    """Log the key details of the state for debugging."""
+    print(f"[DEBUG {prefix}] conversation_history length: {len(state.conversation_history)}")
+    print(f"[DEBUG {prefix}] current_question_index: {state.current_question_index}")
+    print(f"[DEBUG {prefix}] responses count: {len(state.responses)}")
+    print(f"[DEBUG {prefix}] term_extraction_queue: {state.term_extraction_queue}")
+    print(f"[DEBUG {prefix}] extracted_terms count: {len(state.extracted_terms)}")
+    print(f"[DEBUG {prefix}] thread_id: {id(state)}")  # Help identify if state objects are the same
 
-@entrypoint(checkpointer=term_extraction_memory)
+@entrypoint(checkpointer=shared_memory)
 def term_extraction_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
-    print("[DEBUG TE] term_extraction_workflow invoked with action:", action)
+    # Get state from action or previous, or create new if neither exists
     state = action.get("state", None) or (previous if previous is not None else ChatState())
-    print("[DEBUG TE] Initial state:", state)
+    
+    # Debugging track the thread_id if available
+    thread_id = config.get("configurable", {}).get("thread_id") if config else "unknown"
+    print(f"[DEBUG TE] Running with thread_id: {thread_id}")
+    debug_state("TE-Initial", state)
     
     if action is None:
         print("[DEBUG TE] No action provided; returning state.")
@@ -127,19 +143,25 @@ def term_extraction_workflow(action: Dict = None, *, previous: ChatState = None,
     if action.get("action") == "process":
         print("[DEBUG TE] Processing extraction action.")
         next_index = get_next_extraction_task(state)
-        print(f"[DEBUG TE] Received state with verified_answers: {state.verified_answers}")
-        print(f"[DEBUG TE] Extraction queue: {state.term_extraction_queue}")
+        
         if next_index is not None and next_index in state.verified_answers:
             verified_item = state.verified_answers[next_index]
             question = verified_item.get("question", "")
             answer = verified_item.get("answer", "")
-            print(f"[DEBUG TE] Processing extraction for index {next_index}: Question: {question[:50]}, Answer: {answer[:50]}")
+            
+            # Log the question and answer we're processing (truncated for readability)
+            print(f"[DEBUG TE] Processing extraction for index {next_index}")
+            print(f"[DEBUG TE] Question: {question[:50]}{'...' if len(question) > 50 else ''}")
+            print(f"[DEBUG TE] Answer: {answer[:50]}{'...' if len(answer) > 50 else ''}")
+            
+            # Extract terms
             terms = extract_terms(question, answer).result()
             print(f"[DEBUG TE] Extracted terms: {terms}")
+            
+            # Update state with extracted terms
             state.extracted_terms[next_index] = terms
             state = mark_extraction_complete(state, next_index)
-            print(f"[DEBUG TE] Extraction complete. Updated state (extracted_terms): {state.extracted_terms}")
-            print(f"[DEBUG TE] Updated extraction queue: {state.term_extraction_queue}")
+            debug_state("TE-AfterExtraction", state)
         else:
             print("[DEBUG TE] No valid items in extraction queue.")
     
@@ -151,9 +173,5 @@ def term_extraction_workflow(action: Dict = None, *, previous: ChatState = None,
         }
         print(f"[DEBUG TE] Extraction status: {extraction_status}")
     
-    print(f"[DEBUG TE] Returning state: extracted_terms: {state.extracted_terms}, queue: {state.term_extraction_queue}")
+    debug_state("TE-Final", state)
     return state
-
-
-
-

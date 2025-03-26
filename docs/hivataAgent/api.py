@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 # Import the parent workflow that coordinates both agents
 from parent_workflow import parent_workflow, get_full_state
 from term_extractor import term_extraction_workflow 
+from question_answer import question_answer_workflow
 
 app = FastAPI()
 
@@ -86,7 +87,11 @@ def start_session():
 @app.post("/next", response_model=NextResponse)
 def next_step(req: NextRequest):
     """Process the user's answer and return the next question (or follow-up verification)."""
+    print(f"[DEBUG API] Using thread_id: {req.session_id}")
     config = {"configurable": {"thread_id": req.session_id}}
+
+    current_state = parent_workflow.get_state(config)
+    print(f"[DEBUG API] Retrieved state has {len(current_state.values.conversation_history)} messages")
     
     try:
         result = parent_workflow.invoke({"action": "answer", "answer": req.answer}, config)
@@ -259,6 +264,154 @@ def get_extracted_terms(session_id: str):
             "extraction_queue_length": 0,
             "error": str(e)
         }
+
+@app.get("/inspect-model-context/{session_id}")
+def inspect_model_context(session_id: str, question_index: int = None):
+    """
+    Debug endpoint to inspect the context sent to the LLM.
+    
+    This endpoint retrieves the conversation history and questions from the parent 
+    and question-answer workflows, constructs the system and user prompts, 
+    estimates token counts, and returns the full context that the LLM would receive.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    
+    try:
+        # Retrieve the parent workflow state.
+        parent_state_snapshot = parent_workflow.get_state(config)
+        if not hasattr(parent_state_snapshot, "values"):
+            return {"error": "No state found for this session"}
+        parent_state = parent_state_snapshot.values
+        
+        # Retrieve the question_answer workflow state.
+        from question_answer import question_answer_workflow, get_questions
+        qa_state_snapshot = question_answer_workflow.get_state(config)
+        if not hasattr(qa_state_snapshot, "values"):
+            return {"error": "No question-answer state found for this session"}
+        qa_state = qa_state_snapshot.values
+        
+        # Extract questions and conversation history.
+        if isinstance(qa_state, dict):
+            questions = qa_state.get("questions", [])
+            conversation_history = qa_state.get("conversation_history", [])
+            current_qa_index = qa_state.get("current_question_index", 0)
+        else:
+            questions = getattr(qa_state, "questions", [])
+            conversation_history = getattr(qa_state, "conversation_history", [])
+            current_qa_index = getattr(qa_state, "current_question_index", 0)
+        
+        # If no questions, try to load them from the module.
+        if not questions:
+            print("[DEBUG] No questions found in state, fetching from module")
+            questions = get_questions()
+        
+        # Determine which question index to use.
+        if question_index is None:
+            question_index = current_qa_index
+            print(f"[DEBUG] Using current question index: {question_index}")
+        
+        # Validate question index.
+        if not questions:
+            return {
+                "error": "No questions available in state or module",
+                "current_index": current_qa_index,
+                "state_type": type(qa_state).__name__
+            }
+        if question_index < 0 or question_index >= len(questions):
+            return {
+                "error": f"Invalid question index: {question_index}, current index is {current_qa_index}",
+                "valid_range": f"0-{len(questions)-1}",
+                "questions_count": len(questions)
+            }
+        
+        # Get the current question and its formatted requirements.
+        current_question = questions[question_index]
+        if isinstance(current_question, dict) and "requirements" in current_question:
+            formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in current_question['requirements'].items()])
+            question_text = current_question.get('text', '')
+        else:
+            return {
+                "error": f"Question at index {question_index} doesn't have the expected format",
+                "question_structure": str(type(current_question)),
+                "question_data": str(current_question)[:200]  # Truncated for brevity.
+            }
+        
+        # Format the conversation history for context.
+        formatted_history = ""
+        for msg in conversation_history:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            formatted_history += f"{role.upper()}: {content}\n\n"
+        
+        # Define the system prompt.
+        system_prompt = (
+            "You are an expert medical validator for a questionnaire about polymicrogyria. "
+            "Your task is to evaluate if a user's answer meets the specified requirements. "
+            "Be thorough but fair in your assessment."
+        )
+        
+        # Construct the user prompt with the question, requirements, and conversation history.
+        user_prompt = (
+            f"QUESTION: {question_text}\n\n"
+            f"REQUIREMENTS:\n{formatted_requirements}\n\n"
+            f"CONVERSATION HISTORY:\n{formatted_history}\n"
+            f"USER'S ANSWER: [Most recent answer would appear here]\n\n"
+            f"Evaluate if this answer meets all the requirements. If it's valid, explain why. "
+            f"If it's invalid, specify which requirements weren't met and provide helpful follow-up questions."
+        )
+        
+        # Attempt to compute token counts using tiktoken (if installed).
+        try:
+            import tiktoken
+            encoding = tiktoken.encoding_for_model("gpt-4")
+            system_tokens = len(encoding.encode(system_prompt))
+            user_tokens = len(encoding.encode(user_prompt))
+            total_tokens = system_tokens + user_tokens
+        except Exception as e:
+            total_tokens = "Unable to calculate (tiktoken not installed)"
+            system_tokens = "N/A"
+            user_tokens = "N/A"
+        
+        # Include some state information for debugging.
+        if isinstance(qa_state, dict):
+            state_info = {
+                "questions_count": len(questions),
+                "is_complete": qa_state.get("is_complete", False),
+                "verified_answers_count": len(qa_state.get("verified_answers", {})),
+                "extraction_queue_length": len(qa_state.get("term_extraction_queue", []))
+            }
+        else:
+            state_info = {
+                "questions_count": len(questions),
+                "is_complete": getattr(qa_state, "is_complete", False),
+                "verified_answers_count": len(getattr(qa_state, "verified_answers", {})),
+                "extraction_queue_length": len(getattr(qa_state, "term_extraction_queue", []))
+            }
+        
+        return {
+            "session_id": session_id,
+            "current_question_index": question_index,
+            "question": question_text,
+            "total_conversation_history_length": len(conversation_history),
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "token_estimates": {
+                "system_tokens": system_tokens,
+                "user_tokens": user_tokens,
+                "total_tokens": total_tokens,
+                "note": "These are estimates based on GPT-4 tokenization"
+            },
+            "state_info": state_info
+        }
+    except Exception as e:
+        import traceback
+        print(f"[DEBUG] Error inspecting model context: {str(e)}")
+        print(traceback.format_exc())
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
