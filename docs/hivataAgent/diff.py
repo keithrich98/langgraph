@@ -53,15 +53,10 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
           
       - {"action": "status"}:
           * Retrieve and print the current status from both the question_answer and term_extraction workflows.
-    
-    After the question_answer workflow updates the state with the new answer (and queues it for extraction),
-    if there are items in state.term_extraction_queue, the workflow starts a background thread to handle extraction.
-    This allows the API to return the next question immediately without waiting for term extraction to complete.
     """
     # Use previous state or initialize a new one.
     state = previous if previous is not None else ChatState()
-
-    # tracks the thread_id for debugging
+    
     thread_id = config.get("configurable", {}).get("thread_id") if config else "unknown"
     print(f"[DEBUG Parent] Running with thread_id: {thread_id}")
     debug_state("Parent-Initial", state)
@@ -71,23 +66,11 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
         return state
     
     if action.get("action") in ["start", "answer"]:
-    # Include the current state in the action to ensure QA workflow has access to it
-        qa_action = {
-            "action": action.get("action"),
-            "state": state,  # Pass the current state explicitly
-        }
+        # Forward the action (start or answer) to the question_answer workflow.
+        qa_result = question_answer_workflow.invoke(action, config=config)
         
-        # Copy any other action parameters
-        if action.get("answer"):
-            qa_action["answer"] = action.get("answer")
-        
-        # Call QA workflow with the enhanced action
-        qa_result = question_answer_workflow.invoke(qa_action, config=config)
-    
         if qa_result:
-            # Update the parent's state with the fields from the question_answer workflow:
-            # This includes the current question index, questions list, conversation history,
-            # responses, completion status, verified answers, and the extraction queue.
+            # Update the parent's state with the fields from the question_answer workflow
             print(f"[DEBUG Parent] QA returned state with {len(qa_result.conversation_history)} messages")
             state.current_question_index = qa_result.current_question_index
             state.questions = qa_result.questions if qa_result.questions else state.questions
@@ -114,7 +97,6 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
             thread.start()
     
     elif action.get("action") == "extract_terms":
-        # This is the action that runs the term extraction
         print("[DEBUG Parent] Running term extraction.")
         
         if state.term_extraction_queue:

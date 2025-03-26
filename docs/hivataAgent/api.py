@@ -13,8 +13,8 @@ from fastapi.responses import StreamingResponse
 
 # Import the parent workflow that coordinates both agents
 from parent_workflow import parent_workflow, get_full_state
-from term_extractor import term_extraction_workflow 
-from question_answer import question_answer_workflow
+from term_extractor import process_term_extraction 
+from question_answer import process_question_answer
 
 app = FastAPI()
 
@@ -215,29 +215,15 @@ def get_extracted_terms(session_id: str):
     config = {"configurable": {"thread_id": session_id}}
     
     try:
-        # Get parent state snapshot
+        # Retrieve the parent's state snapshot from shared memory.
         parent_state_snapshot = parent_workflow.get_state(config)
         parent_state = parent_state_snapshot.values if hasattr(parent_state_snapshot, "values") else None
         
-        # Also get term extractor state to make sure we have the most recent terms
-        extract_state_snapshot = term_extraction_workflow.get_state(config)
-        extract_state = extract_state_snapshot.values if hasattr(extract_state_snapshot, "values") else None
-        
-        # Log states for debugging
-        print(f"[DEBUG API] Parent state snapshot: {parent_state}")
-        print(f"[DEBUG API] Extract state snapshot: {extract_state}")
-        
-        # Get values from parent state
         if parent_state is not None:
             current_index = getattr(parent_state, "current_question_index", 0)
             is_complete = getattr(parent_state, "is_complete", False)
             queue_length = len(getattr(parent_state, "term_extraction_queue", []))
-            
-            # Get extracted terms, preferring the extraction workflow's state if available
-            if extract_state is not None and hasattr(extract_state, "extracted_terms"):
-                extracted_terms = extract_state.extracted_terms
-            else:
-                extracted_terms = getattr(parent_state, "extracted_terms", {})
+            extracted_terms = getattr(parent_state, "extracted_terms", {})
         else:
             extracted_terms = {}
             current_index = 0
@@ -253,7 +239,6 @@ def get_extracted_terms(session_id: str):
             "extraction_queue_length": queue_length
         }
     except Exception as e:
-        # Exception handling remains the same
         import traceback
         print(f"[DEBUG API] Error retrieving extracted terms: {str(e)}")
         print(traceback.format_exc())
@@ -264,6 +249,7 @@ def get_extracted_terms(session_id: str):
             "extraction_queue_length": 0,
             "error": str(e)
         }
+
 
 @app.get("/inspect-model-context/{session_id}")
 def inspect_model_context(session_id: str, question_index: int = None):

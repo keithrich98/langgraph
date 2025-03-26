@@ -1,21 +1,16 @@
-# question_answer.py - Modified from graph.py to work in the multi-agent system
+# question_answer.py - Task version for multi-agent system
 
 import os
 import json
-from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
-from langgraph.func import entrypoint, task
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.func import task
 from langchain_core.runnables import RunnableConfig
 
 # Import the shared state and helper functions
 from state import ChatState, add_to_extraction_queue
-# In question_answer.py
-# Replace the existing question_answer_memory definition
-from shared_memory import shared_memory
-
-# The entrypoint decorator should remain the same as it will now use the shared memory
+# We no longer need a separate MemorySaver here since state is passed from the parent.
+from shared_memory import shared_memory  # (Imported for consistency if needed elsewhere)
 
 # Set up the LLM for verification
 from langchain_openai import ChatOpenAI
@@ -91,20 +86,14 @@ def verify_answer(question: Dict[str, Any], answer: str, conversation_history: L
         if response.tool_calls and len(response.tool_calls) > 0:
             # Extract the verification result
             tool_call = response.tool_calls[0]
-            
-            # Use Pydantic to validate and create a proper object
             result = VerificationResult(**tool_call["args"])
-            
-            # Return the verification result
             return result.is_valid, result.verification_message
         
         # Fallback if no tool calls were made (rare case)
         if hasattr(response, "content") and response.content:
-            # Try to infer validity from content
             is_valid = "valid" in response.content.lower() and "not valid" not in response.content.lower()
             return is_valid, response.content
             
-        # Ultimate fallback
         return False, "Unable to verify your answer. Please provide more details."
         
     except Exception as e:
@@ -141,37 +130,32 @@ def get_questions():
     ]
 
 def debug_state(prefix: str, state: ChatState):
-    """Log the key details of the state for debugging."""
+    """Log key details of the state for debugging."""
     print(f"[DEBUG {prefix}] conversation_history length: {len(state.conversation_history)}")
     print(f"[DEBUG {prefix}] current_question_index: {state.current_question_index}")
     print(f"[DEBUG {prefix}] responses count: {len(state.responses)}")
     print(f"[DEBUG {prefix}] term_extraction_queue: {state.term_extraction_queue}")
-    print(f"[DEBUG {prefix}] thread_id: {id(state)}")  # Help identify if state objects are the same
+    print(f"[DEBUG {prefix}] thread_id: {id(state)}")  # To help identify if state objects are the same
 
-@entrypoint(checkpointer=shared_memory)
-def question_answer_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
+@task
+def process_question_answer(state: ChatState, action: Dict = None, config: Optional[RunnableConfig] = None) -> ChatState:
     """
-    A questionnaire workflow with a verification step using LLM function calling.
+    Task that processes a questionnaire action (start or answer) using LLM function calling.
     
     Actions:
-      {"action": "start"} - Start a new questionnaire session.
-      {"action": "answer", "answer": "user answer"} - Submit an answer.
+      - {"action": "start"}: Initializes a new session.
+      - {"action": "answer", "answer": "user answer"}: Processes an answer.
     
-    Modified to add verified answers to the extraction queue for the term extractor.
+    Returns the updated state.
     """
-    # Use previous state or initialize a new one with questions.
-    state = previous if previous is not None else ChatState(questions=get_questions())
-    
     thread_id = config.get("configurable", {}).get("thread_id") if config else "unknown"
     print(f"[DEBUG QA] Running with thread_id: {thread_id}")
     debug_state("QA-Initial", state)
     
     if action is None:
-        # If no action is provided, simply return the current state.
         return state
     
     if action.get("action") == "start":
-        # Reset the state for a new session
         state.current_question_index = 0
         state.is_complete = False
         state.responses = {}
@@ -179,41 +163,34 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
         state.term_extraction_queue = []
         state.extracted_terms = {}
         
+        # If questions are not already provided, load them.
+        if not state.questions:
+            state.questions = get_questions()
+        
         question = state.questions[0]
-        # Format requirements as bullet points for better readability
         formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in question['requirements'].items()])
         prompt = f"{question['text']}\n\nRequirements:\n{formatted_requirements}"
-        
         state.conversation_history = [{"role": "ai", "content": prompt}]
-        
         debug_state("QA-AfterStart", state)
     
     elif action.get("action") == "answer" and not state.is_complete:
         answer = action.get("answer", "")
-        # Append the human answer to the conversation history
         state.conversation_history.append({"role": "human", "content": answer})
         debug_state("QA-AfterHumanAnswer", state)
         
-        # Get verification from the LLM
         current_question = state.questions[state.current_question_index]
         is_valid, verification_message = verify_answer(current_question, answer, state.conversation_history, config)
-
-        # Append the verification message from the LLM to the conversation
+        
         state.conversation_history.append({"role": "ai", "content": verification_message})
         debug_state("QA-AfterVerification", state)
         
         if is_valid:
-            # Valid answer: store and move to the next question
             state.responses[state.current_question_index] = answer
-
-            # Add to verified answers for term extraction
             state.verified_answers[state.current_question_index] = {
                 "question": current_question["text"],
                 "answer": answer,
                 "verification": verification_message
             }
-
-            # Ensure the verified answer is added to the extraction queue
             state = add_to_extraction_queue(state, state.current_question_index)
             
             state.current_question_index += 1
@@ -224,12 +201,10 @@ def question_answer_workflow(action: Dict = None, *, previous: ChatState = None,
                     "content": "Thank you for completing all the questions. Your responses have been recorded."
                 })
             else:
-                # Present the next question
                 next_question = state.questions[state.current_question_index]
                 formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in next_question['requirements'].items()])
                 prompt = f"{next_question['text']}\n\nRequirements:\n{formatted_requirements}"
                 state.conversation_history.append({"role": "ai", "content": prompt})
-            
             debug_state("QA-AfterValidAnswer", state)
         else:
             debug_state("QA-AfterInvalidAnswer", state)
