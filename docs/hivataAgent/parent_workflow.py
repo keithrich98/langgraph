@@ -28,10 +28,21 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     Main workflow that coordinates the question-answer and term-extraction tasks.
     
     Actions:
-      - {"action": "start"}: Initialize a new session.
-      - {"action": "answer", "answer": "user answer"}: Process a new answer.
-      - {"action": "extract_terms"}: Process term extraction.
-      - {"action": "status"}: Log the current state.
+      - {"action": "start"}:
+          * Initialize a new questionnaire session.
+          * The question_answer workflow sends the first question to the human.
+          
+      - {"action": "answer", "answer": "user answer"}:
+          * The human submits an answer.
+          * The question_answer workflow verifies the answer.
+          * If verified, the verified answer is stored in state.verified_answers and its index is added to the term_extraction_queue.
+          * The workflow then triggers term extraction asynchronously in a background thread.
+          
+      - {"action": "extract_terms"}:
+          * Process items in the term extraction queue.
+          
+      - {"action": "status"}:
+          * Retrieve and print the current status from both the question_answer and term_extraction workflows.
       
     This refactored workflow calls child agents as tasks so that the parent state is always passed along.
     """

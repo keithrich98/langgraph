@@ -1,4 +1,4 @@
-# term_extractor.py - Medical Term Extraction Agent
+# term_extractor.py - Refactored as a task
 
 import os
 import time
@@ -7,66 +7,47 @@ from langgraph.func import task
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
 
-# Import the shared state helpers
 from state import ChatState, get_next_extraction_task, mark_extraction_complete
+from shared_memory import shared_memory  # not used directly here
 
-# Set up the LLM for term extraction
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if openai_api_key is None:
     raise ValueError("OPENAI_API_KEY is not set in your environment.")
-
 llm = ChatOpenAI(
-    model_name="gpt-4", 
+    model_name="gpt-4",
     openai_api_key=openai_api_key,
     temperature=0
 )
 
-# Define the prompt template for term extraction
 extraction_prompt = ChatPromptTemplate.from_template("""
-You are an agent who is an expert in generating API search terms that are going to be used to hit the National Library of Medicine's Unified Medical Language System (UMLS) API.
+You are an agent who is an expert in generating API search terms for the UMLS API.
 
 <api_description>
-The Search API is designed to help users query the UMLS Metathesaurus to find relevant biomedical and health-related concepts. It acts as a search engine for the UMLS, enabling users to look up terms, concepts, and their associated metadata. For example, if you search for a medical term like "myocardial infarction," the API will return information about the concept, including its unique identifier (CUI), definitions, synonyms, and relationships to other concepts in the UMLS.
+The Search API helps users query the UMLS Metathesaurus for biomedical and health-related concepts.
 </api_description>
 
 <task>
-- Use the context given to you to generate one or more human readable term, such as 'gestational diabetes', 'heart attack' to be used as the `query` parameter for the Search API.
-- Use your vast medical knowledge to look for potential abbreviations or de-abbreviations for a search term thus generating variations for the same search term if possible.
-- Extract medical, social, and other entities from context, like "paternal cousin", "great grand mother", "sugar", "cigarettes", etc.
+- Use the provided context to generate one or more human-readable terms (e.g. "heart attack") to be used as the query.
+- Consider variations, abbreviations, and related entities.
 </task>
 
 <context>
-Summary:
 Question: {question}
 Answer: {answer}
-Purpose or reason for the UMLS code:
-To extract relevant medical terminology for better understanding and categorization of patient data.
+Purpose:
+Extract relevant medical terminology.
 </context>
 
-Based on the context, provide a list of search terms for the UMLS API. Format your response as a JSON array of strings.
+Provide your answer as a JSON array of strings.
 """)
 
 @task
 def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] = None) -> List[str]:
-    """
-    Extract medical terminology from a question-answer pair.
-    
-    Args:
-        question: The medical question.
-        answer: The user's answer.
-        config: Optional runtime configuration.
-    
-    Returns:
-        A list of extracted medical terms.
-    """
     try:
-        formatted_prompt = extraction_prompt.format(
-            question=question,
-            answer=answer
-        )
+        formatted_prompt = extraction_prompt.format(question=question, answer=answer)
         response = llm.invoke(formatted_prompt, config=config)
         content = response.content if hasattr(response, "content") else str(response)
         try:
@@ -90,7 +71,7 @@ def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] =
                 return terms
             return ["ERROR: Expected array of terms"]
         except Exception as e:
-            print(f"Error parsing extracted terms: {str(e)}")
+            print(f"Error parsing terms: {str(e)}")
             lines = content.split('\n')
             terms = []
             for line in lines:
@@ -105,7 +86,6 @@ def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] =
         return ["ERROR: Term extraction failed"]
 
 def debug_state(prefix: str, state: ChatState):
-    """Log key details of the state for debugging."""
     print(f"[DEBUG {prefix}] conversation_history length: {len(state.conversation_history)}")
     print(f"[DEBUG {prefix}] current_question_index: {state.current_question_index}")
     print(f"[DEBUG {prefix}] responses count: {len(state.responses)}")
@@ -114,38 +94,37 @@ def debug_state(prefix: str, state: ChatState):
     print(f"[DEBUG {prefix}] thread_id: {id(state)}")
 
 @task
-def process_term_extraction(state: ChatState, config: Optional[RunnableConfig] = None) -> ChatState:
+def term_extraction_task(state: ChatState, action: Dict = None, config: Optional[RunnableConfig] = None) -> ChatState:
     """
-    Task that processes term extraction from the state.
-    
-    It looks at the extraction queue, extracts medical terms from the corresponding verified answer,
-    updates the state with the extracted terms, and marks the extraction as complete.
-    
-    Returns:
-        The updated state.
+    Task to process term extraction.
+    Expects an action {"action": "extract_terms"}.
+    Updates state with extracted terms and removes the processed index from the queue.
     """
-    thread_id = config.get("configurable", {}).get("thread_id") if config else "unknown"
-    print(f"[DEBUG TE] Running with thread_id: {thread_id}")
     debug_state("TE-Initial", state)
     
+    # Check for the correct action key; update from "process" to "extract_terms"
+    if action is None or action.get("action") != "extract_terms":
+        print("[DEBUG TE] No 'extract_terms' action provided; returning state unchanged.")
+        return state
+
     next_index = get_next_extraction_task(state)
     if next_index is not None and next_index in state.verified_answers:
         verified_item = state.verified_answers[next_index]
         question = verified_item.get("question", "")
         answer = verified_item.get("answer", "")
         print(f"[DEBUG TE] Processing extraction for index {next_index}")
-        print(f"[DEBUG TE] Question: {question[:50]}{'...' if len(question) > 50 else ''}")
-        print(f"[DEBUG TE] Answer: {answer[:50]}{'...' if len(answer) > 50 else ''}")
-        
-        # Call the extract_terms task and wait for the result.
+        print(f"[DEBUG TE] Verified question: {question}")
+        print(f"[DEBUG TE] Verified answer: {answer}")
+        # Call the extraction task and capture the response
         terms = extract_terms(question, answer, config=config).result()
-        print(f"[DEBUG TE] Extracted terms: {terms}")
-        
+        print(f"[DEBUG TE] LLM returned raw extracted terms: {terms}")
         state.extracted_terms[next_index] = terms
         state = mark_extraction_complete(state, next_index)
         debug_state("TE-AfterExtraction", state)
     else:
-        print("[DEBUG TE] No valid items in extraction queue.")
+        print("[DEBUG TE] No valid verified answer found in the extraction queue.")
     
     debug_state("TE-Final", state)
     return state
+
+
