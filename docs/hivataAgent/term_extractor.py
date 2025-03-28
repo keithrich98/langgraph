@@ -94,7 +94,11 @@ def debug_state(prefix: str, state: ChatState):
     print(f"[DEBUG {prefix}] thread_id: {id(state)}")
 
 @task
-def term_extraction_task(state: ChatState, action: Dict = None, config: Optional[RunnableConfig] = None) -> ChatState:
+def term_extraction_task(
+    state: ChatState,
+    action: Dict = None,
+    config: Optional[RunnableConfig] = None
+) -> ChatState:
     """
     Task to process term extraction.
     Expects an action {"action": "extract_terms"}.

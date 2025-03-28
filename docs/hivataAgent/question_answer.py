@@ -31,7 +31,12 @@ class VerificationResult(BaseModel):
     missing_requirements: List[str] = Field(default_factory=list, description="Requirements not met")
     verification_message: str = Field(description="Verification or follow-up message")
 
-def verify_answer(question: Dict[str, Any], answer: str, conversation_history: List[Dict[str, str]], config: Optional[RunnableConfig] = None) -> (bool, str):
+def verify_answer(
+    question: Dict[str, Any],
+    answer: str,
+    conversation_history: List[Dict[str, str]],
+    config: Optional[RunnableConfig] = None
+) -> (bool, str):
     formatted_requirements = "\n".join([f"- {key}: {value}" for key, value in question['requirements'].items()])
     formatted_history = ""
     for msg in conversation_history:
@@ -39,7 +44,7 @@ def verify_answer(question: Dict[str, Any], answer: str, conversation_history: L
         content = msg['content']
         formatted_history += f"{role.upper()}: {content}\n\n"
     system_message = SystemMessage(content=
-        "You are an expert medical validator for a questionnaire about polymicrogyria. "
+        "You are an expert medical validator for a questionnaire about polymicrogyria."
         "Evaluate if the user's answer meets the specified requirements."
     )
     user_message = HumanMessage(content=
@@ -113,7 +118,11 @@ def debug_state(prefix: str, state: ChatState):
     print(f"[DEBUG {prefix}] thread_id: {id(state)}")
 
 @task
-def question_answer_task(action: Dict = None, state: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
+def question_answer_task(
+    action: Dict = None,
+    state: ChatState = None,
+    config: Optional[RunnableConfig] = None
+) -> ChatState:
     """
     Task to process question-answer logic.
     Expects an action dict with "action": "start" or "answer" (with "answer" field).
