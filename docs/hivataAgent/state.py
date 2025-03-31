@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
+# Import the logger from logging_config
+from logging_config import logger
 
 @dataclass
 class ChatState:
@@ -48,12 +50,12 @@ def add_to_extraction_queue(state: ChatState, question_index: int) -> ChatState:
     Returns:
         Updated ChatState.
     """
-    print(f"[DEBUG] add_to_extraction_queue called for index: {question_index}")
+    logger.debug(f"State: add_to_extraction_queue called for index: {question_index}")
     if question_index not in state.term_extraction_queue:
         state.term_extraction_queue.append(question_index)
-        print(f"[DEBUG] Added index {question_index} to extraction queue. Current queue: {state.term_extraction_queue}")
+        logger.debug(f"State: Added index {question_index} to extraction queue. Current queue: {state.term_extraction_queue}")
     else:
-        print(f"[DEBUG] Index {question_index} already exists in extraction queue: {state.term_extraction_queue}")
+        logger.debug(f"State: Index {question_index} already exists in extraction queue: {state.term_extraction_queue}")
     return state
 
 def get_next_extraction_task(state: ChatState) -> Optional[int]:
@@ -67,10 +69,10 @@ def get_next_extraction_task(state: ChatState) -> Optional[int]:
         Next question index to process or None if the queue is empty.
     """
     if not state.term_extraction_queue:
-        print("[DEBUG] get_next_extraction_task: Extraction queue is empty.")
+        logger.debug("State: get_next_extraction_task: Extraction queue is empty.")
         return None
     next_index = state.term_extraction_queue[0]
-    print(f"[DEBUG] get_next_extraction_task: Next index to extract is {next_index}.")
+    logger.debug(f"State: get_next_extraction_task: Next index to extract is {next_index}.")
     return next_index
 
 def mark_extraction_complete(state: ChatState, question_index: int) -> ChatState:
@@ -84,11 +86,11 @@ def mark_extraction_complete(state: ChatState, question_index: int) -> ChatState
     Returns:
         Updated ChatState.
     """
-    print(f"[DEBUG] mark_extraction_complete: Marking index {question_index} as complete.")
+    logger.debug(f"State: mark_extraction_complete: Marking index {question_index} as complete.")
     if question_index in state.term_extraction_queue:
         state.term_extraction_queue.remove(question_index)
-        print(f"[DEBUG] mark_extraction_complete: Removed index {question_index} from extraction queue. Current queue: {state.term_extraction_queue}")
+        logger.debug(f"State: mark_extraction_complete: Removed index {question_index} from extraction queue. Current queue: {state.term_extraction_queue}")
     else:
-        print(f"[DEBUG] mark_extraction_complete: Index {question_index} not found in extraction queue: {state.term_extraction_queue}")
+        logger.debug(f"State: mark_extraction_complete: Index {question_index} not found in extraction queue: {state.term_extraction_queue}")
     state.last_extracted_index = question_index
     return state

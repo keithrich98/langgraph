@@ -10,6 +10,8 @@ from langchain_core.runnables import RunnableConfig
 # Import shared state and helper
 from state import ChatState, add_to_extraction_queue
 from shared_memory import shared_memory  # not used here as entrypoint, but kept for consistency
+# Import the logger from logging_config
+from logging_config import logger
 
 # Set up the LLM for verification
 from langchain_openai import ChatOpenAI
@@ -69,7 +71,7 @@ def verify_answer(
             return is_valid, response.content
         return False, "Unable to verify your answer. Please provide more details."
     except Exception as e:
-        print(f"Error in verification: {str(e)}")
+        logger.error(f"Error in verification: {str(e)}")
         return False, f"There was an error verifying your answer: {str(e)}"
 
 # def verify_answer(question: Dict[str, Any], answer: str, conversation_history: List[Dict[str, str]], config: Optional[RunnableConfig] = None) -> (bool, str):
@@ -110,13 +112,6 @@ def get_questions():
         }
     ]
 
-def debug_state(prefix: str, state: ChatState):
-    print(f"[DEBUG {prefix}] conversation_history length: {len(state.conversation_history)}")
-    print(f"[DEBUG {prefix}] current_question_index: {state.current_question_index}")
-    print(f"[DEBUG {prefix}] responses count: {len(state.responses)}")
-    print(f"[DEBUG {prefix}] term_extraction_queue: {state.term_extraction_queue}")
-    print(f"[DEBUG {prefix}] thread_id: {id(state)}")
-
 @task
 def question_answer_task(
     action: Dict = None,
@@ -134,7 +129,12 @@ def question_answer_task(
     elif not state.questions:
         state.questions = get_questions()
 
-    debug_state("QA-Initial", state)
+    # Log key details of initial state
+    logger.debug(f"QA-Initial: conversation_history length: {len(state.conversation_history)}")
+    logger.debug(f"QA-Initial: current_question_index: {state.current_question_index}")
+    logger.debug(f"QA-Initial: responses count: {len(state.responses)}")
+    logger.debug(f"QA-Initial: term_extraction_queue: {state.term_extraction_queue}")
+    logger.debug(f"QA-Initial: thread_id: {id(state)}")
     
     if action is None:
         return state
@@ -152,17 +152,34 @@ def question_answer_task(
         prompt = f"{question['text']}\n\nRequirements:\n{formatted_requirements}"
         state.conversation_history = [{"role": "ai", "content": prompt}]
         
-        debug_state("QA-AfterStart", state)
+        # Log key details after start
+        logger.debug(f"QA-AfterStart: conversation_history length: {len(state.conversation_history)}")
+        logger.debug(f"QA-AfterStart: current_question_index: {state.current_question_index}")
+        logger.debug(f"QA-AfterStart: responses count: {len(state.responses)}")
+        logger.debug(f"QA-AfterStart: term_extraction_queue: {state.term_extraction_queue}")
+        logger.debug(f"QA-AfterStart: thread_id: {id(state)}")
     
     elif action.get("action") == "answer" and not state.is_complete:
         answer = action.get("answer", "")
         state.conversation_history.append({"role": "human", "content": answer})
-        debug_state("QA-AfterHumanAnswer", state)
+        
+        # Log key details after human answer
+        logger.debug(f"QA-AfterHumanAnswer: conversation_history length: {len(state.conversation_history)}")
+        logger.debug(f"QA-AfterHumanAnswer: current_question_index: {state.current_question_index}")
+        logger.debug(f"QA-AfterHumanAnswer: responses count: {len(state.responses)}")
+        logger.debug(f"QA-AfterHumanAnswer: term_extraction_queue: {state.term_extraction_queue}")
+        logger.debug(f"QA-AfterHumanAnswer: thread_id: {id(state)}")
         
         current_question = state.questions[state.current_question_index]
         is_valid, verification_message = verify_answer(current_question, answer, state.conversation_history, config)
         state.conversation_history.append({"role": "ai", "content": verification_message})
-        debug_state("QA-AfterVerification", state)
+        
+        # Log key details after verification
+        logger.debug(f"QA-AfterVerification: conversation_history length: {len(state.conversation_history)}")
+        logger.debug(f"QA-AfterVerification: current_question_index: {state.current_question_index}")
+        logger.debug(f"QA-AfterVerification: responses count: {len(state.responses)}")
+        logger.debug(f"QA-AfterVerification: term_extraction_queue: {state.term_extraction_queue}")
+        logger.debug(f"QA-AfterVerification: thread_id: {id(state)}")
         
         if is_valid:
             state.responses[state.current_question_index] = answer
@@ -184,9 +201,26 @@ def question_answer_task(
                 formatted_requirements = "\n".join([f"- {k}: {v}" for k, v in next_question["requirements"].items()])
                 prompt = f"{next_question['text']}\n\nRequirements:\n{formatted_requirements}"
                 state.conversation_history.append({"role": "ai", "content": prompt})
-            debug_state("QA-AfterValidAnswer", state)
+            
+            # Log key details after valid answer
+            logger.debug(f"QA-AfterValidAnswer: conversation_history length: {len(state.conversation_history)}")
+            logger.debug(f"QA-AfterValidAnswer: current_question_index: {state.current_question_index}")
+            logger.debug(f"QA-AfterValidAnswer: responses count: {len(state.responses)}")
+            logger.debug(f"QA-AfterValidAnswer: term_extraction_queue: {state.term_extraction_queue}")
+            logger.debug(f"QA-AfterValidAnswer: thread_id: {id(state)}")
         else:
-            debug_state("QA-AfterInvalidAnswer", state)
+            # Log key details after invalid answer
+            logger.debug(f"QA-AfterInvalidAnswer: conversation_history length: {len(state.conversation_history)}")
+            logger.debug(f"QA-AfterInvalidAnswer: current_question_index: {state.current_question_index}")
+            logger.debug(f"QA-AfterInvalidAnswer: responses count: {len(state.responses)}")
+            logger.debug(f"QA-AfterInvalidAnswer: term_extraction_queue: {state.term_extraction_queue}")
+            logger.debug(f"QA-AfterInvalidAnswer: thread_id: {id(state)}")
     
-    debug_state("QA-Final", state)
+    # Log key details of final state
+    logger.debug(f"QA-Final: conversation_history length: {len(state.conversation_history)}")
+    logger.debug(f"QA-Final: current_question_index: {state.current_question_index}")
+    logger.debug(f"QA-Final: responses count: {len(state.responses)}")
+    logger.debug(f"QA-Final: term_extraction_queue: {state.term_extraction_queue}")
+    logger.debug(f"QA-Final: thread_id: {id(state)}")
+    
     return state

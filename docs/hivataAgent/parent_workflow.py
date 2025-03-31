@@ -14,14 +14,8 @@ from question_answer import question_answer_task
 from term_extractor import term_extraction_task
 # Use the shared memory checkpointer
 from shared_memory import shared_memory
-
-def debug_state(prefix: str, state: ChatState):
-    """Log key details of the state for debugging."""
-    print(f"[DEBUG {prefix}] conversation_history length: {len(state.conversation_history)}")
-    print(f"[DEBUG {prefix}] current_question_index: {state.current_question_index}")
-    print(f"[DEBUG {prefix}] responses count: {len(state.responses)}")
-    print(f"[DEBUG {prefix}] term_extraction_queue: {state.term_extraction_queue}")
-    print(f"[DEBUG {prefix}] thread_id: {id(state)}")  # to see if state objects are the same
+# Import the logger from logging_config
+from logging_config import logger
 
 @entrypoint(checkpointer=shared_memory)
 def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: Optional[RunnableConfig] = None) -> ChatState:
@@ -38,8 +32,14 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     state = previous if previous is not None else ChatState()
     
     thread_id = config.get("configurable", {}).get("thread_id", "unknown") if config else "unknown"
-    print(f"[DEBUG Parent] Running with thread_id: {thread_id}")
-    debug_state("Parent-Initial", state)
+    logger.debug(f"Running with thread_id: {thread_id}")
+    
+    # Log key details of initial state
+    logger.debug(f"Parent-Initial: conversation_history length: {len(state.conversation_history)}")
+    logger.debug(f"Parent-Initial: current_question_index: {state.current_question_index}")
+    logger.debug(f"Parent-Initial: responses count: {len(state.responses)}")
+    logger.debug(f"Parent-Initial: term_extraction_queue: {state.term_extraction_queue}")
+    logger.debug(f"Parent-Initial: thread_id: {id(state)}")
     
     if action is None:
         return state
@@ -48,11 +48,17 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     if action.get("action") in ["start", "answer"]:
         # Call the QA task synchronously passing current state and action.
         state = question_answer_task(action, state, config=config).result()
-        debug_state("Parent-AfterQA", state)
+        
+        # Log key details after QA
+        logger.debug(f"Parent-AfterQA: conversation_history length: {len(state.conversation_history)}")
+        logger.debug(f"Parent-AfterQA: current_question_index: {state.current_question_index}")
+        logger.debug(f"Parent-AfterQA: responses count: {len(state.responses)}")
+        logger.debug(f"Parent-AfterQA: term_extraction_queue: {state.term_extraction_queue}")
+        logger.debug(f"Parent-AfterQA: thread_id: {id(state)}")
         
         # For "answer", if there are items queued for term extraction, trigger extraction asynchronously.
         if action.get("action") == "answer" and state.term_extraction_queue:
-            print(f"[DEBUG Extraction] Triggering async term extraction. Queue: {state.term_extraction_queue}")
+            logger.debug(f"Extraction: Triggering async term extraction. Queue: {state.term_extraction_queue}")
             thread = threading.Thread(
                 target=trigger_extraction_in_thread,
                 args=(thread_id,)
@@ -63,32 +69,44 @@ def parent_workflow(action: Dict = None, *, previous: ChatState = None, config: 
     elif action.get("action") == "extract_terms":
         # Call the term extraction task synchronously.
         state = term_extraction_task(state, action, config=config).result()
-        debug_state("Parent-AfterExtraction", state)
+        
+        # Log key details after extraction
+        logger.debug(f"Parent-AfterExtraction: conversation_history length: {len(state.conversation_history)}")
+        logger.debug(f"Parent-AfterExtraction: current_question_index: {state.current_question_index}")
+        logger.debug(f"Parent-AfterExtraction: responses count: {len(state.responses)}")
+        logger.debug(f"Parent-AfterExtraction: term_extraction_queue: {state.term_extraction_queue}")
+        logger.debug(f"Parent-AfterExtraction: thread_id: {id(state)}")
         
     elif action.get("action") == "status":
         # For status, we could simply print relevant info.
-        print("System Status:")
-        print(f"- Questions: {state.current_question_index}/{len(state.questions) if state.questions else 0}")
-        print(f"- Complete: {state.is_complete}")
-        print(f"- Extraction Queue: {len(state.term_extraction_queue)} items")
-        print(f"- Extracted Terms: {len(state.extracted_terms)} questions processed")
+        logger.info("System Status:")
+        logger.info(f"- Questions: {state.current_question_index}/{len(state.questions) if state.questions else 0}")
+        logger.info(f"- Complete: {state.is_complete}")
+        logger.info(f"- Extraction Queue: {len(state.term_extraction_queue)} items")
+        logger.info(f"- Extracted Terms: {len(state.extracted_terms)} questions processed")
     
-    debug_state("Parent-Final", state)
+    # Log key details of final state
+    logger.debug(f"Parent-Final: conversation_history length: {len(state.conversation_history)}")
+    logger.debug(f"Parent-Final: current_question_index: {state.current_question_index}")
+    logger.debug(f"Parent-Final: responses count: {len(state.responses)}")
+    logger.debug(f"Parent-Final: term_extraction_queue: {state.term_extraction_queue}")
+    logger.debug(f"Parent-Final: thread_id: {id(state)}")
+    
     return state
 
 def trigger_extraction_in_thread(thread_id: Optional[str] = None):
     """Background thread function to trigger term extraction."""
     try:
-        print(f"[DEBUG Thread] Starting extraction thread for thread_id: {thread_id}")
+        logger.debug(f"Thread: Starting extraction thread for thread_id: {thread_id}")
         time.sleep(0.5)  # Short delay
         config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
         # Invoke the parent workflow with extract_terms action.
         parent_workflow.invoke({"action": "extract_terms"}, config=config)
-        print(f"[DEBUG Thread] Extraction completed for thread_id: {thread_id}")
+        logger.debug(f"Thread: Extraction completed for thread_id: {thread_id}")
     except Exception as e:
         import traceback
-        print(f"[DEBUG Thread] Error in extraction thread: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"Thread: Error in extraction thread: {str(e)}")
+        logger.error(traceback.format_exc())
 
 def get_full_state(thread_id: str) -> Dict:
     """
@@ -108,8 +126,8 @@ def get_full_state(thread_id: str) -> Dict:
         return result
     except Exception as e:
         import traceback
-        print(f"[DEBUG] Error in get_full_state: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"Error in get_full_state: {str(e)}")
+        logger.error(traceback.format_exc())
         return {
             "error": str(e),
             "current_index": 0,

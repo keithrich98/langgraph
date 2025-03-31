@@ -139,48 +139,53 @@ def process_answer(thread_id: str, answer: str) -> Dict:
     """
     Process a user answer within the questionnaire.
     
-    This uses the LLM-based verification workflow for verification,
-    but only advances to the next question when an answer is fully verified.
+    This function invokes the multi-agent workflow (medical_questionnaire) which includes the
+    verification_agent. If the verification_agent confirms that the answer meets all requirements,
+    the current question index is advanced and the next question is appended to the conversation history.
+    Otherwise, if verification is unsuccessful or incomplete, the function retains the current question
+    and only adds the follow-up verification message to prompt the human for more information.
     """
     logger.info(f"Processing answer for thread_id: {thread_id}")
     logger.debug(f"Answer: {answer}")
     
-    # Get existing state
+    # Retrieve the existing state for the conversation
     state = get_state_for_thread(thread_id)
     if not state:
         logger.error(f"No active session found with thread_id: {thread_id}")
         raise ValueError(f"No active session found with thread_id: {thread_id}")
     
-    # Create user message
+    # Create a user message from the human's answer
     user_message = {
         "role": "user",
         "content": answer
     }
     
-    # Add to conversation history first
+    # Append the user's answer to the current conversation history and update state
     existing_messages = state.conversation_history + [user_message]
     state.conversation_history = existing_messages
     update_state_for_thread(thread_id, state)
     
-    # Invoke the workflow with the full conversation history
+    # Invoke the multi-agent workflow with the full conversation history
     logger.info("Invoking medical_questionnaire workflow with user answer for verification")
     config = {"configurable": {"thread_id": thread_id}}
     result = medical_questionnaire.invoke({"messages": existing_messages}, config)
     
-    # Extract response messages
+    # Initialize a new conversation history to build our updated history
     conversation_history = []
+    # Variables to track the verification outcome
     verification_complete = False
     verification_successful = False
     
-    # Process messages and detect verification status
+    # Process each message returned from the workflow
     for msg in result.get("messages", []):
+        # Handle human messages
         if isinstance(msg, HumanMessage):
             conversation_history.append({"role": "human", "content": msg.content})
+        # Handle AI messages
         elif isinstance(msg, AIMessage):
             content = msg.content if msg.content else ""
             conversation_history.append({"role": "ai", "content": content})
-            
-            # Look for verification status in the content
+            # Check for cues that indicate verification status
             if "could you also provide" in content.lower() or "need more information" in content.lower():
                 verification_complete = True
                 verification_successful = False
@@ -189,14 +194,13 @@ def process_answer(thread_id: str, answer: str) -> Dict:
                 verification_complete = True
                 verification_successful = True
                 logger.info("Verification completed successfully")
-                
+        # Handle tool messages
         elif isinstance(msg, ToolMessage):
             conversation_history.append({"role": "system", "content": msg.content})
+        # Handle messages that are dictionaries
         elif isinstance(msg, dict):
             conversation_history.append(msg)
             content = msg.get("content", "")
-            
-            # Also check dict messages for verification status
             if "could you also provide" in content.lower() or "need more information" in content.lower():
                 verification_complete = True
                 verification_successful = False
@@ -206,49 +210,46 @@ def process_answer(thread_id: str, answer: str) -> Dict:
                 verification_successful = True
                 logger.info("Verification completed successfully")
     
-    # CRITICAL CONDITION: Only advance to next question if verification was successful
+    # Only if verification is successful, advance to the next question.
     if verification_successful:
-        logger.info("Verification successful, using deterministic approach to get next question")
-        
-        # Store the answer in state and advance to next question
+        logger.info("Verification successful, advancing to next question")
+        # Record the verified answer in state
         state.responses[state.current_question_index] = answer
-        
-        # Advance to next question
+        # Advance to the next question index
         state.current_question_index += 1
         logger.info(f"Advanced to question index: {state.current_question_index}")
         
-        # Check if we've reached the end of questions
+        # If there are no more questions, mark the session complete and add a completion message.
         if state.current_question_index >= len(state.questions):
             logger.info("Reached end of questions, marking as complete")
             state.is_complete = True
             update_state_for_thread(thread_id, state)
-            # Add completion message
             completion_message = {
                 "role": "ai", 
                 "content": "All questions have been completed. Thank you for participating in this questionnaire."
             }
             conversation_history.append(completion_message)
         else:
-            # Get the next question directly from the questions list
+            # If more questions remain, format and append the next question
             next_question = state.questions[state.current_question_index]
             formatted_requirements = "\n".join([f"- {k}: {v}" for k, v in next_question["requirements"].items()])
             next_question_text = f"{next_question['text']}\n\nRequirements:\n{formatted_requirements}"
-            
-            # Add next question to conversation history
             next_question_message = {
                 "role": "ai", 
                 "content": next_question_text
             }
             conversation_history.append(next_question_message)
     else:
-        logger.info("Verification unsuccessful or incomplete, not advancing to next question")
-        # We don't add the next question - let the LLM conversation serve as the follow-up
+        # If verification is not successful, do not advance the question index.
+        # Retain the current question and the verification follow-up messages.
+        logger.info("Verification unsuccessful or incomplete; retaining the current question")
+        # (Optionally, you may choose to filter out any accidental advancement messages here)
     
-    # Update state with the conversation history
+    # Update state with the new conversation history
     state.conversation_history = conversation_history
     update_state_for_thread(thread_id, state)
     
-    # Get updated state (should be the same as our local one, but for consistency)
+    # Retrieve the updated state for consistency and return the necessary information
     updated_state = get_state_for_thread(thread_id)
     
     return {
@@ -256,6 +257,7 @@ def process_answer(thread_id: str, answer: str) -> Dict:
         "current_question_index": updated_state.current_question_index if updated_state else 0,
         "is_complete": updated_state.is_complete if updated_state else False
     }
+
 
 def get_questionnaire_state(thread_id: str) -> Dict:
     """
