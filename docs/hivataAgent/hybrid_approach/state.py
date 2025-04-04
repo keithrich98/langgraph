@@ -24,7 +24,11 @@ class SessionState:
     verification_messages: Dict[int, str] = field(default_factory=dict)
     verification_result: Dict[str, Any] = field(default_factory=dict)
     
-    # For future extensions
+    # Storage for verified answers ready for term extraction
+    # Format: {question_index: {"question": str, "answer": str, "verification": str}}
+    verified_answers: Dict[int, Dict[str, str]] = field(default_factory=dict)
+    
+    # Term extraction state
     extracted_terms: Dict[int, List[str]] = field(default_factory=dict)
     term_extraction_queue: List[int] = field(default_factory=list)
     
@@ -85,6 +89,42 @@ def add_to_extraction_queue(state: SessionState, question_index: int) -> Session
     
     return state
 
+def get_next_extraction_task(state: SessionState) -> Optional[int]:
+    """
+    Get the next question index that needs term extraction.
+    
+    Args:
+        state: Current state.
+        
+    Returns:
+        Next question index to process or None if the queue is empty.
+    """
+    if not state.term_extraction_queue:
+        logger.debug("State: get_next_extraction_task: Extraction queue is empty.")
+        return None
+    next_index = state.term_extraction_queue[0]
+    logger.debug(f"State: get_next_extraction_task: Next index to extract is {next_index}.")
+    return next_index
+
+def mark_extraction_complete(state: SessionState, question_index: int) -> SessionState:
+    """
+    Mark a question as having completed term extraction.
+    
+    Args:
+        state: Current state.
+        question_index: Index of the question that was processed.
+        
+    Returns:
+        Updated SessionState.
+    """
+    logger.debug(f"State: mark_extraction_complete: Marking index {question_index} as complete.")
+    if question_index in state.term_extraction_queue:
+        state.term_extraction_queue.remove(question_index)
+        logger.debug(f"State: mark_extraction_complete: Removed index {question_index} from extraction queue. Current queue: {state.term_extraction_queue}")
+    else:
+        logger.debug(f"State: mark_extraction_complete: Index {question_index} not found in extraction queue: {state.term_extraction_queue}")
+    return state
+
 def convert_dict_keys_to_strings(data: Dict) -> Dict:
     """Convert all dictionary integer keys to strings for API compatibility."""
     logger.debug("Converting dictionary keys to strings")
@@ -124,7 +164,9 @@ def to_dict(state: SessionState) -> Dict[str, Any]:
             "responses": state.responses,
             "verified_responses": state.verified_responses,
             "verification_messages": state.verification_messages,
+            "verified_answers": state.verified_answers,
             "extracted_terms": state.extracted_terms,
+            "term_extraction_queue": state.term_extraction_queue,
             "current_question": get_formatted_current_question(state)
         }
         

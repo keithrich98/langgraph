@@ -1,7 +1,7 @@
 # question_agent.py
 from langgraph.func import task
 from typing import Dict, List, Any
-from state import SessionState, get_formatted_current_question
+from state import SessionState, get_formatted_current_question, add_to_extraction_queue
 
 # Import logger
 from logging_config import logger
@@ -113,6 +113,23 @@ def advance_question(state: SessionState) -> SessionState:
     """Advance to the next question after verification."""
     current_index = state.current_index
     logger.info(f"Advancing from question {current_index} to next question")
+    
+    # If verification succeeded, add to the term extraction queue
+    if state.verification_result.get("is_valid", False):
+        question_text = state.questions[current_index]["text"]
+        answer = state.responses.get(current_index, "")
+        verification_message = state.verification_messages.get(current_index, "")
+        
+        # Store the verified answer for term extraction
+        state.verified_answers[current_index] = {
+            "question": question_text,
+            "answer": answer,
+            "verification": verification_message
+        }
+        
+        # Add to the term extraction queue
+        state = add_to_extraction_queue(state, current_index)
+        logger.info(f"Added question {current_index} to term extraction queue")
     
     state.current_index += 1
     

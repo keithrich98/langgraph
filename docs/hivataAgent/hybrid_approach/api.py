@@ -45,6 +45,9 @@ class AnswerResponse(BaseModel):
     is_complete: bool
     verified_responses: Dict[str, bool] = {}  # Use string keys
     verification_messages: Dict[str, str] = {}  # Use string keys
+    verified_answers: Dict[str, Dict[str, str]] = {}  # Use string keys
+    extracted_terms: Dict[str, List[str]] = {}  # Use string keys
+    term_extraction_queue: List[int] = []
 
 class SessionStateResponse(BaseModel):
     """Response model for session state retrieval."""
@@ -55,7 +58,9 @@ class SessionStateResponse(BaseModel):
     responses: Dict[str, str]  # Use string keys
     verified_responses: Dict[str, bool] = {}  # Use string keys
     verification_messages: Dict[str, str] = {}  # Use string keys
+    verified_answers: Dict[str, Dict[str, str]] = {}  # Use string keys
     extracted_terms: Dict[str, List[str]] = {}  # Use string keys
+    term_extraction_queue: List[int] = []
 
 # Helper function to convert numeric dictionary keys to strings
 def convert_numeric_keys_to_strings(data: dict) -> dict:

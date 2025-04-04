@@ -1,12 +1,14 @@
 # parent_workflow.py
 import uuid
+import threading
+import time
 from typing import Dict, Any, Optional
 from langgraph.func import entrypoint
 from langchain_core.runnables import RunnableConfig
 
 # Import shared memory and state management
 from shared_memory import shared_memory
-from state import SessionState, to_dict
+from state import SessionState, to_dict, get_next_extraction_task
 
 # Import agent tasks
 from question_agent import (
@@ -16,6 +18,7 @@ from question_agent import (
     advance_question
 )
 from verification_agent import verify_answer
+from term_extractor_agent import term_extraction_task
 
 # Import logger
 from logging_config import logger
@@ -28,6 +31,7 @@ def workflow(action: Dict[str, Any] = None, *, previous: SessionState = None, co
     Actions:
     - {"action": "start"}: Initialize the questionnaire
     - {"action": "answer", "answer": "..."}: Process a user answer
+    - {"action": "extract_terms"}: Process the next term extraction task
     """
     # Get thread_id for logging context
     thread_id = config.get("configurable", {}).get("thread_id", "unknown") if config else "unknown"
@@ -95,9 +99,44 @@ def workflow(action: Dict[str, Any] = None, *, previous: SessionState = None, co
                 logger.debug(f"Presenting question {state.current_index} for thread_id: {thread_id}")
                 state = present_next_question(state).result()
                 logger.debug(f"Conversation history after presenting next question: {len(state.conversation_history)} messages")
+            
+            # If there are items queued for term extraction, trigger it asynchronously
+            if state.term_extraction_queue:
+                logger.debug(f"Extraction: Triggering async term extraction. Queue: {state.term_extraction_queue}")
+                thread = threading.Thread(
+                    target=trigger_extraction_in_thread,
+                    args=(thread_id,)
+                )
+                thread.daemon = True
+                thread.start()
         else:
             logger.debug(f"Answer is invalid, requesting correction for thread_id: {thread_id}")
             logger.debug(f"Conversation history after verification failure: {len(state.conversation_history)} messages")
+    
+    # Process term extraction
+    elif action.get("action") == "extract_terms":
+        logger.info(f"Processing term extraction for thread_id: {thread_id}")
+        logger.debug(f"Term extraction queue before processing: {state.term_extraction_queue}")
+        
+        # Check if there are items to process
+        if state.term_extraction_queue:
+            # Call the term extraction task
+            state = term_extraction_task(state, action, config=config).result()
+            logger.debug(f"Term extraction completed, queue size now: {len(state.term_extraction_queue)}")
+            logger.debug(f"Extracted terms count: {len(state.extracted_terms)}")
+            
+            # If there are more items, trigger another extraction
+            if state.term_extraction_queue:
+                logger.debug("More items in queue, triggering next extraction")
+                thread = threading.Thread(
+                    target=trigger_extraction_in_thread,
+                    args=(thread_id,)
+                )
+                thread.daemon = True
+                thread.start()
+        else:
+            logger.debug("No items in term extraction queue")
+    
     else:
         logger.warning(f"Invalid action or questionnaire already complete: {action} (thread_id: {thread_id})")
         if state.is_complete:
@@ -149,6 +188,20 @@ def process_user_answer(session_id: str, answer: str):
     except Exception as e:
         logger.error(f"Error processing answer for session {session_id}: {str(e)}", exc_info=True)
         raise
+
+def trigger_extraction_in_thread(thread_id: Optional[str] = None):
+    """Background thread function to trigger term extraction."""
+    try:
+        logger.debug(f"Thread: Starting extraction thread for thread_id: {thread_id}")
+        time.sleep(0.5)  # Short delay
+        config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
+        # Invoke the workflow with extract_terms action
+        workflow.invoke({"action": "extract_terms"}, config=config)
+        logger.debug(f"Thread: Extraction completed for thread_id: {thread_id}")
+    except Exception as e:
+        import traceback
+        logger.error(f"Thread: Error in extraction thread: {str(e)}")
+        logger.error(traceback.format_exc())
 
 def get_session_state(session_id: str):
     """Get the current state of a session."""
