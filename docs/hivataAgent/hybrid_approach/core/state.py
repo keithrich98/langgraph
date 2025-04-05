@@ -1,17 +1,26 @@
 # state.py
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Any, Optional, TypedDict, Union, Annotated
+from copy import deepcopy
 
 # Import logger
-from logging_config import logger
+from hivataAgent.hybrid_approach.config.logging_config import logger
 
-@dataclass
+@dataclass(frozen=True)
 class SessionState:
-    """Unified state for the entire workflow."""
+    """
+    Unified state for the entire workflow.
+    
+    Uses immutable dataclass for thread safety when using asyncio or threading.
+    Use the create_updated_state() function to create a new state instance with updates.
+    """
     # Question-related state
     questions: List[Dict[str, Any]] = field(default_factory=list)
     current_index: int = 0
     is_complete: bool = False
+    
+    # Current action being processed
+    current_action: Optional[Dict[str, Any]] = None
     
     # Conversation tracking
     conversation_history: List[Dict[str, str]] = field(default_factory=list)
@@ -32,9 +41,45 @@ class SessionState:
     extracted_terms: Dict[int, List[str]] = field(default_factory=dict)
     term_extraction_queue: List[int] = field(default_factory=list)
     
+    # Error tracking
+    error: Optional[str] = None
+    
     def __post_init__(self):
         """Log when a new state instance is created."""
         logger.debug("New SessionState instance created")
+
+def create_updated_state(state: SessionState, **updates) -> SessionState:
+    """
+    Create a new state instance with updates applied.
+    
+    This function ensures immutability by creating a new copy with specified updates.
+    For nested dictionaries and lists, deep copies are created to prevent shared references.
+    
+    Args:
+        state: Current state to be updated
+        **updates: Keyword arguments with fields to update
+        
+    Returns:
+        A new SessionState instance with updates applied
+    """
+    # Handle nested structures that need deep copying
+    processed_updates = {}
+    
+    for key, value in updates.items():
+        if isinstance(value, dict) or isinstance(value, list):
+            processed_updates[key] = deepcopy(value)
+        else:
+            processed_updates[key] = value
+    
+    # Create a new instance with updates
+    try:
+        new_state = replace(state, **processed_updates)
+        logger.debug(f"Created updated state with changes to: {', '.join(updates.keys())}")
+        return new_state
+    except Exception as e:
+        logger.error(f"Error creating updated state: {str(e)}", exc_info=True)
+        # Return original state if update fails
+        return state
 
 def get_current_question(state: SessionState) -> Optional[Dict[str, Any]]:
     """Helper to get the current question from state."""
@@ -81,13 +126,14 @@ def add_to_extraction_queue(state: SessionState, question_index: int) -> Session
     """Add a question index to the term extraction queue."""
     logger.info(f"Adding question {question_index} to term extraction queue")
     
+    # Avoid modifying the original state
     if question_index not in state.term_extraction_queue:
-        state.term_extraction_queue.append(question_index)
-        logger.debug(f"Question {question_index} added to extraction queue. Queue size: {len(state.term_extraction_queue)}")
+        new_queue = state.term_extraction_queue.copy() + [question_index]
+        logger.debug(f"Question {question_index} added to extraction queue. Queue size: {len(new_queue)}")
+        return create_updated_state(state, term_extraction_queue=new_queue)
     else:
-        logger.debug(f"Question {question_index} already in extraction queue, skipping")
-    
-    return state
+        logger.debug(f"Question {question_index} already in extraction queue, not modifying state")
+        return state
 
 def get_next_extraction_task(state: SessionState) -> Optional[int]:
     """
@@ -102,6 +148,7 @@ def get_next_extraction_task(state: SessionState) -> Optional[int]:
     if not state.term_extraction_queue:
         logger.debug("State: get_next_extraction_task: Extraction queue is empty.")
         return None
+    
     next_index = state.term_extraction_queue[0]
     logger.debug(f"State: get_next_extraction_task: Next index to extract is {next_index}.")
     return next_index
@@ -118,12 +165,17 @@ def mark_extraction_complete(state: SessionState, question_index: int) -> Sessio
         Updated SessionState.
     """
     logger.debug(f"State: mark_extraction_complete: Marking index {question_index} as complete.")
+    
+    # Create a new queue without the processed index
     if question_index in state.term_extraction_queue:
-        state.term_extraction_queue.remove(question_index)
-        logger.debug(f"State: mark_extraction_complete: Removed index {question_index} from extraction queue. Current queue: {state.term_extraction_queue}")
+        new_queue = [idx for idx in state.term_extraction_queue if idx != question_index]
+        logger.debug(f"State: mark_extraction_complete: Removed index {question_index} from extraction queue. "
+                   f"Current queue: {new_queue}")
+        return create_updated_state(state, term_extraction_queue=new_queue)
     else:
-        logger.debug(f"State: mark_extraction_complete: Index {question_index} not found in extraction queue: {state.term_extraction_queue}")
-    return state
+        logger.debug(f"State: mark_extraction_complete: Index {question_index} not found in extraction queue: "
+                   f"{state.term_extraction_queue}")
+        return state
 
 def convert_dict_keys_to_strings(data: Dict) -> Dict:
     """Convert all dictionary integer keys to strings for API compatibility."""
@@ -170,6 +222,10 @@ def to_dict(state: SessionState) -> Dict[str, Any]:
             "current_question": get_formatted_current_question(state)
         }
         
+        # Add error if present
+        if state.error:
+            raw_dict["error"] = state.error
+        
         # Convert all integer keys to strings for FastAPI/Pydantic compatibility
         result = convert_dict_keys_to_strings(raw_dict)
         
@@ -182,5 +238,5 @@ def to_dict(state: SessionState) -> Dict[str, Any]:
             "current_index": -1,
             "is_complete": False,
             "conversation_history": [],
-            "error": "Error converting state to dictionary"
+            "error": f"Error converting state to dictionary: {str(e)}"
         }

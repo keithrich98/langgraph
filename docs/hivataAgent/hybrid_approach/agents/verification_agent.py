@@ -1,14 +1,19 @@
 # verification_agent.py
 from langgraph.func import task
 from typing import Dict, Any, List, Tuple
-from state import SessionState, get_current_question, add_to_extraction_queue
+from hivataAgent.hybrid_approach.core.state import (
+    SessionState, 
+    get_current_question, 
+    add_to_extraction_queue, 
+    create_updated_state
+)
 import os
 from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # Import logger
-from logging_config import logger
+from hivataAgent.hybrid_approach.config.logging_config import logger
 
 # Load environment variables from .env file
 load_dotenv()
@@ -35,7 +40,7 @@ else:
     use_llm = True
     logger.info("Successfully initialized Azure OpenAI for verification")
 
-@task
+# Removed @task decorator to prevent Future objects
 def verify_answer(state: SessionState) -> SessionState:
     """
     Verify if the user's answer meets the requirements of the current question.
@@ -86,21 +91,21 @@ def verify_answer(state: SessionState) -> SessionState:
         logger.info(f"Answer to question {current_index} is INVALID")
         logger.debug(f"Verification message: {verification_message}")
     
-    # Store verification results
-    state.verified_responses[current_index] = is_valid
-    state.verification_messages[current_index] = verification_message
+    # Create new verified_responses and verification_messages dictionaries
+    new_verified_responses = state.verified_responses.copy()
+    new_verified_responses[current_index] = is_valid
     
-    # Add verification message to conversation history
-    state.conversation_history.append({"role": "system", "content": verification_message})
+    new_verification_messages = state.verification_messages.copy()
+    new_verification_messages[current_index] = verification_message
+    
+    # Create new conversation history with verification message
+    new_conversation_history = state.conversation_history.copy() + [
+        {"role": "system", "content": verification_message}
+    ]
     logger.debug("Added verification message to conversation history")
     
-    # If valid, add to extraction queue for future term extraction
-    if is_valid:
-        logger.debug(f"Adding question {current_index} to term extraction queue")
-        state = add_to_extraction_queue(state, current_index)
-    
-    # Store the verification result for the parent workflow
-    state.verification_result = {
+    # Create new verification result
+    new_verification_result = {
         "action": "verified_answer",
         "question_index": current_index,
         "answer": current_answer,
@@ -108,8 +113,17 @@ def verify_answer(state: SessionState) -> SessionState:
         "is_valid": is_valid
     }
     
+    # Create updated state with all the changes
+    new_state = create_updated_state(
+        state,
+        verified_responses=new_verified_responses,
+        verification_messages=new_verification_messages,
+        conversation_history=new_conversation_history,
+        verification_result=new_verification_result
+    )
+    
     logger.debug("Updated state with verification result")
-    return state
+    return new_state
 
 def llm_verification_with_context(
     current_answer: str, 

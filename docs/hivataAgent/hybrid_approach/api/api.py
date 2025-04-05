@@ -7,10 +7,10 @@ import uvicorn
 import time
 
 # Import the parent workflow functions
-from parent_workflow import start_session, process_user_answer, get_session_state
+from hivataAgent.hybrid_approach.core.parent_workflow import start_session, process_user_answer, get_session_state
 
 # Import logger
-from logging_config import logger
+from hivataAgent.hybrid_approach.config.logging_config import logger
 
 app = FastAPI(title="Medical Questionnaire API", 
               description="API for a questionnaire with verification")
