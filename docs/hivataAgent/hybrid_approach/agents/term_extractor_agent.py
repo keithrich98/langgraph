@@ -1,7 +1,7 @@
 # term_extractor_agent.py
 import os
 from typing import Dict, List, Any, Optional
-from langgraph.func import task
+# No need to import task decorator
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -53,7 +53,6 @@ Extract relevant medical terminology.
 Provide your answer as a JSON array of strings.
 """)
 
-@task
 def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] = None) -> List[str]:
     """
     Task to extract medical terms from a verified answer.
@@ -126,7 +125,6 @@ def extract_terms(question: str, answer: str, config: Optional[RunnableConfig] =
         logger.error(f"Error in term extraction: {str(e)}", exc_info=True)
         return ["ERROR: Term extraction failed"]
 
-# Removed @task decorator to prevent Future objects
 def term_extraction_task(
     state: SessionState,
     action: Dict = None,
@@ -160,9 +158,8 @@ def term_extraction_task(
         logger.debug(f"Question: {question[:50]}...")
         logger.debug(f"Answer: {answer[:50]}...")
         
-        # Call the extraction task and resolve the future immediately to prevent serialization issues
-        terms_future = extract_terms(question, answer, config=config)
-        terms = terms_future.result() if hasattr(terms_future, 'result') else terms_future
+        # Call the extraction function directly
+        terms = extract_terms(question, answer, config=config)
         logger.info(f"Extracted {len(terms)} terms for question {next_index}")
         logger.debug(f"Terms: {terms}")
         
@@ -170,14 +167,14 @@ def term_extraction_task(
         new_extracted_terms = state.extracted_terms.copy()
         new_extracted_terms[next_index] = terms
         
-        # Create updated state with new terms
-        new_state = create_updated_state(state, extracted_terms=new_extracted_terms)
+        # Create updated state with new terms using Pydantic update method
+        updated_state = state.update(extracted_terms=new_extracted_terms)
         
         # Mark as complete in the queue
-        new_state = mark_extraction_complete(new_state, next_index)
-        logger.debug(f"Term extraction completed for question {next_index}, queue size now: {len(new_state.term_extraction_queue)}")
+        final_state = mark_extraction_complete(updated_state, next_index)
+        logger.debug(f"Term extraction completed for question {next_index}, queue size now: {len(final_state.term_extraction_queue)}")
         
-        return new_state
+        return final_state
     else:
         logger.warning(f"No verified answer found for question {next_index}")
     

@@ -1,5 +1,5 @@
 # question_agent.py
-from langgraph.func import task
+# No need to import task decorator
 from typing import Dict, List, Any
 from hivataAgent.hybrid_approach.core.state import (
     SessionState, 
@@ -45,18 +45,19 @@ def get_questions():
     logger.debug(f"Loaded {len(questions)} questions")
     return questions
 
-# Removed @task decorator to prevent Future objects
 def initialize_questions(state: SessionState) -> SessionState:
     """Initialize the questionnaire with questions."""
     logger.info("Initializing questionnaire state")
     
     # Load questions
     questions = get_questions()
-    conversation_history = [{"role": "system", "content": get_formatted_current_question(create_updated_state(state, questions=questions, current_index=0)) or "Welcome to the questionnaire."}]
     
-    # Create a new state object with updated values (using immutable pattern)
-    state = create_updated_state(
-        state,
+    # Create a temporary state with questions to get the formatted first question
+    temp_state = state.update(questions=questions, current_index=0)
+    conversation_history = [{"role": "system", "content": get_formatted_current_question(temp_state) or "Welcome to the questionnaire."}]
+    
+    # Create a new state object with updated values (using Pydantic update pattern)
+    updated_state = state.update(
         questions=questions,
         current_index=0,
         is_complete=False,
@@ -69,11 +70,10 @@ def initialize_questions(state: SessionState) -> SessionState:
         conversation_history=conversation_history
     )
     
-    logger.debug(f"State initialized with {len(state.questions)} questions, starting at index {state.current_index}")
+    logger.debug(f"State initialized with {len(updated_state.questions)} questions, starting at index {updated_state.current_index}")
     
-    return state
+    return updated_state
 
-# Removed @task decorator to prevent Future objects
 def present_next_question(state: SessionState) -> SessionState:
     """Present the next question in the sequence."""
     logger.info(f"Presenting next question (index: {state.current_index})")
@@ -87,8 +87,7 @@ def present_next_question(state: SessionState) -> SessionState:
             "content": "Thank you for completing all the questions. Your responses have been recorded."
         }]
         
-        return create_updated_state(
-            state, 
+        return state.update(
             is_complete=True,
             conversation_history=new_conversation_history
         )
@@ -100,12 +99,11 @@ def present_next_question(state: SessionState) -> SessionState:
         new_conversation_history = state.conversation_history.copy() + [
             {"role": "system", "content": formatted_question}
         ]
-        return create_updated_state(state, conversation_history=new_conversation_history)
+        return state.update(conversation_history=new_conversation_history)
     else:
         logger.warning(f"Failed to get formatted question for index {state.current_index}")
         return state
 
-# Removed @task decorator to prevent Future objects
 def process_answer(state: SessionState, answer: str) -> SessionState:
     """Process a user's answer to the current question."""
     logger.info(f"Processing answer for question index {state.current_index}")
@@ -123,20 +121,17 @@ def process_answer(state: SessionState, answer: str) -> SessionState:
     
     logger.debug(f"Stored answer for question {current_index}, total responses: {len(new_responses)}")
     
-    return create_updated_state(
-        state,
+    return state.update(
         conversation_history=new_conversation_history,
         responses=new_responses
     )
 
-# Removed @task decorator to prevent Future objects
 def advance_question(state: SessionState) -> SessionState:
     """Advance to the next question after verification."""
     current_index = state.current_index
     logger.info(f"Advancing from question {current_index} to next question")
     
-    # Start with current state
-    new_state = state
+    updated_state = state
     
     # If verification succeeded, add to the term extraction queue
     if state.verification_result.get("is_valid", False):
@@ -153,24 +148,22 @@ def advance_question(state: SessionState) -> SessionState:
         }
         
         # Update state with new verified answers
-        new_state = create_updated_state(
-            new_state,
+        updated_state = updated_state.update(
             verified_answers=new_verified_answers
         )
         
         # Add to the term extraction queue
-        new_state = add_to_extraction_queue(new_state, current_index)
+        updated_state = add_to_extraction_queue(updated_state, current_index)
         logger.info(f"Added question {current_index} to term extraction queue")
     
     # Update the current index
-    new_state = create_updated_state(
-        new_state,
+    final_state = updated_state.update(
         current_index=current_index + 1
     )
     
-    if new_state.current_index >= len(new_state.questions):
+    if final_state.current_index >= len(final_state.questions):
         logger.info("Advanced to end of questionnaire, next step will mark as complete")
     else:
-        logger.debug(f"Advanced to question index {new_state.current_index}")
+        logger.debug(f"Advanced to question index {final_state.current_index}")
     
-    return new_state
+    return final_state

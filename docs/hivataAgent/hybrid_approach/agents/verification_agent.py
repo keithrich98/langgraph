@@ -1,5 +1,5 @@
 # verification_agent.py
-from langgraph.func import task
+# No need to import task decorator
 from typing import Dict, Any, List, Tuple
 from hivataAgent.hybrid_approach.core.state import (
     SessionState, 
@@ -40,7 +40,6 @@ else:
     use_llm = True
     logger.info("Successfully initialized Azure OpenAI for verification")
 
-# Removed @task decorator to prevent Future objects
 def verify_answer(state: SessionState) -> SessionState:
     """
     Verify if the user's answer meets the requirements of the current question.
@@ -113,9 +112,8 @@ def verify_answer(state: SessionState) -> SessionState:
         "is_valid": is_valid
     }
     
-    # Create updated state with all the changes
-    new_state = create_updated_state(
-        state,
+    # Create updated state with all the changes using Pydantic update method
+    updated_state = state.update(
         verified_responses=new_verified_responses,
         verification_messages=new_verification_messages,
         conversation_history=new_conversation_history,
@@ -123,7 +121,7 @@ def verify_answer(state: SessionState) -> SessionState:
     )
     
     logger.debug("Updated state with verification result")
-    return new_state
+    return updated_state
 
 def llm_verification_with_context(
     current_answer: str, 

@@ -1,21 +1,20 @@
 # state.py
-from dataclasses import dataclass, field, replace
-from typing import Dict, List, Any, Optional, TypedDict, Union, Annotated
+from typing import Dict, List, Any, Optional, TypedDict, Union
+from pydantic import BaseModel, Field
 from copy import deepcopy
 
 # Import logger
 from hivataAgent.hybrid_approach.config.logging_config import logger
 
-@dataclass(frozen=True)
-class SessionState:
+class SessionState(BaseModel):
     """
-    Unified state for the entire workflow.
+    Unified state for the entire workflow using Pydantic for better LangGraph integration.
     
-    Uses immutable dataclass for thread safety when using asyncio or threading.
-    Use the create_updated_state() function to create a new state instance with updates.
+    Uses Pydantic's immutable model pattern for thread safety when using asyncio or threading.
+    Use the model_copy or update() method to create a new state instance with changes.
     """
     # Question-related state
-    questions: List[Dict[str, Any]] = field(default_factory=list)
+    questions: List[Dict[str, Any]] = Field(default_factory=list)
     current_index: int = 0
     is_complete: bool = False
     
@@ -23,63 +22,69 @@ class SessionState:
     current_action: Optional[Dict[str, Any]] = None
     
     # Conversation tracking
-    conversation_history: List[Dict[str, str]] = field(default_factory=list)
+    conversation_history: List[Dict[str, str]] = Field(default_factory=list)
     
     # Response tracking
-    responses: Dict[int, str] = field(default_factory=dict)
-    verified_responses: Dict[int, bool] = field(default_factory=dict)
+    responses: Dict[int, str] = Field(default_factory=dict)
+    verified_responses: Dict[int, bool] = Field(default_factory=dict)
     
     # Verification state
-    verification_messages: Dict[int, str] = field(default_factory=dict)
-    verification_result: Dict[str, Any] = field(default_factory=dict)
+    verification_messages: Dict[int, str] = Field(default_factory=dict)
+    verification_result: Dict[str, Any] = Field(default_factory=dict)
     
     # Storage for verified answers ready for term extraction
     # Format: {question_index: {"question": str, "answer": str, "verification": str}}
-    verified_answers: Dict[int, Dict[str, str]] = field(default_factory=dict)
+    verified_answers: Dict[int, Dict[str, str]] = Field(default_factory=dict)
     
     # Term extraction state
-    extracted_terms: Dict[int, List[str]] = field(default_factory=dict)
-    term_extraction_queue: List[int] = field(default_factory=list)
+    extracted_terms: Dict[int, List[str]] = Field(default_factory=dict)
+    term_extraction_queue: List[int] = Field(default_factory=list)
     
     # Error tracking
     error: Optional[str] = None
     
-    def __post_init__(self):
-        """Log when a new state instance is created."""
+    model_config = {
+        # Prevent arbitrary attributes from being set
+        "extra": "forbid",
+    }
+    
+    def __init__(self, **data):
+        super().__init__(**data)
         logger.debug("New SessionState instance created")
-
-def create_updated_state(state: SessionState, **updates) -> SessionState:
-    """
-    Create a new state instance with updates applied.
     
-    This function ensures immutability by creating a new copy with specified updates.
-    For nested dictionaries and lists, deep copies are created to prevent shared references.
-    
-    Args:
-        state: Current state to be updated
-        **updates: Keyword arguments with fields to update
+    def update(self, **updates) -> "SessionState":
+        """
+        Create a new state instance with updates applied.
         
-    Returns:
-        A new SessionState instance with updates applied
-    """
-    # Handle nested structures that need deep copying
-    processed_updates = {}
-    
-    for key, value in updates.items():
-        if isinstance(value, dict) or isinstance(value, list):
-            processed_updates[key] = deepcopy(value)
-        else:
-            processed_updates[key] = value
-    
-    # Create a new instance with updates
-    try:
-        new_state = replace(state, **processed_updates)
-        logger.debug(f"Created updated state with changes to: {', '.join(updates.keys())}")
-        return new_state
-    except Exception as e:
-        logger.error(f"Error creating updated state: {str(e)}", exc_info=True)
-        # Return original state if update fails
-        return state
+        This method ensures immutability by creating a new copy with specified updates.
+        For nested dictionaries and lists, deep copies are created to prevent shared references.
+        
+        Args:
+            **updates: Keyword arguments with fields to update
+            
+        Returns:
+            A new SessionState instance with updates applied
+        """
+        # Handle nested structures that need deep copying
+        processed_updates = {}
+        
+        for key, value in updates.items():
+            if isinstance(value, dict) or isinstance(value, list):
+                processed_updates[key] = deepcopy(value)
+            else:
+                processed_updates[key] = value
+        
+        # Create a new instance with updates
+        try:
+            new_state = self.model_copy(update=processed_updates)
+            logger.debug(f"Created updated state with changes to: {', '.join(updates.keys())}")
+            return new_state
+        except Exception as e:
+            logger.error(f"Error creating updated state: {str(e)}", exc_info=True)
+            # Return original state if update fails
+            return self
+
+# Helper functions that work with SessionState
 
 def get_current_question(state: SessionState) -> Optional[Dict[str, Any]]:
     """Helper to get the current question from state."""
@@ -130,7 +135,7 @@ def add_to_extraction_queue(state: SessionState, question_index: int) -> Session
     if question_index not in state.term_extraction_queue:
         new_queue = state.term_extraction_queue.copy() + [question_index]
         logger.debug(f"Question {question_index} added to extraction queue. Queue size: {len(new_queue)}")
-        return create_updated_state(state, term_extraction_queue=new_queue)
+        return state.update(term_extraction_queue=new_queue)
     else:
         logger.debug(f"Question {question_index} already in extraction queue, not modifying state")
         return state
@@ -171,7 +176,7 @@ def mark_extraction_complete(state: SessionState, question_index: int) -> Sessio
         new_queue = [idx for idx in state.term_extraction_queue if idx != question_index]
         logger.debug(f"State: mark_extraction_complete: Removed index {question_index} from extraction queue. "
                    f"Current queue: {new_queue}")
-        return create_updated_state(state, term_extraction_queue=new_queue)
+        return state.update(term_extraction_queue=new_queue)
     else:
         logger.debug(f"State: mark_extraction_complete: Index {question_index} not found in extraction queue: "
                    f"{state.term_extraction_queue}")
@@ -240,3 +245,20 @@ def to_dict(state: SessionState) -> Dict[str, Any]:
             "conversation_history": [],
             "error": f"Error converting state to dictionary: {str(e)}"
         }
+
+# For backward compatibility with existing code
+# This allows us to gradually migrate without breaking existing code
+def create_updated_state(state: SessionState, **updates) -> SessionState:
+    """
+    Legacy compatibility function to create a new state instance with updates applied.
+    
+    This function calls state.update() to ensure immutability is maintained.
+    
+    Args:
+        state: Current state to be updated
+        **updates: Keyword arguments with fields to update
+        
+    Returns:
+        A new SessionState instance with updates applied
+    """
+    return state.update(**updates)
