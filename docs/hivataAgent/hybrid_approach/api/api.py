@@ -8,6 +8,7 @@ import time
 
 # Import the parent workflow functions
 from hivataAgent.hybrid_approach.core.parent_workflow import start_session, process_user_answer, get_session_state
+from hivataAgent.hybrid_approach.services.thread_manager import thread_manager
 
 # Import logger
 from hivataAgent.hybrid_approach.config.logging_config import logger
@@ -215,6 +216,31 @@ def health_check():
     """Health check endpoint."""
     logger.debug("API: Health check request received")
     return {"status": "healthy"}
+
+# Thread management and monitoring endpoints
+@app.get("/threads")
+def get_thread_status():
+    """Get current thread manager status."""
+    logger.debug("API: Thread status request received")
+    return thread_manager.get_status_summary()
+
+@app.get("/threads/{task_id}")
+def get_task_status(task_id: str):
+    """Get status of a specific task by task ID."""
+    logger.debug(f"API: Task status request for task_id: {task_id}")
+    return thread_manager.get_task_status(task_id)
+
+@app.get("/threads/active")
+def get_active_tasks():
+    """Get all currently active tasks."""
+    logger.debug("API: Active tasks request received")
+    return thread_manager.get_active_tasks()
+
+@app.get("/threads/history")
+def get_recent_tasks(limit: int = 10, task_type: Optional[str] = None):
+    """Get recently completed tasks with optional filtering by type."""
+    logger.debug(f"API: Task history request received (limit={limit}, type={task_type})")
+    return thread_manager.get_recent_tasks(limit=limit, task_type=task_type)
 
 # Run the server when the script is executed directly
 if __name__ == "__main__":

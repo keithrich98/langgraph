@@ -18,11 +18,13 @@
 - Simplified nested if/else statements with cleaner flow control
 - Added better state-based decision making
 
-## 4. Improve Task Composition for Term Extraction ❌ (Partial)
-- Kept threading approach rather than LangGraph async patterns
-- Improved thread management code to be more robust
-- Added proper thread cleanup and error handling
-- Enhanced trigger_extraction_in_thread() implementation
+## 4. Improve Task Composition for Term Extraction ✅
+- Implemented a dedicated ThreadManager service for robust async processing
+- Added thread tracking, monitoring, and resource management
+- Enhanced extraction with caching, retries, and better error handling
+- Implemented batch processing capabilities
+- Created API endpoints to monitor thread/task status
+- Added smarter parsing strategies for extraction results
 
 ## 5. Leverage entrypoint.final for API Responses ❌ (Not Started)
 - Not yet implemented

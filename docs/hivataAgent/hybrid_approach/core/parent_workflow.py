@@ -1,6 +1,5 @@
 # parent_workflow.py
 import uuid
-import threading
 import time
 from typing import Dict, Any, Optional, List, Literal, cast
 from langgraph.func import entrypoint
@@ -16,6 +15,9 @@ from hivataAgent.hybrid_approach.core.state import (
     get_next_extraction_task, 
     create_updated_state
 )
+
+# Import thread manager
+from hivataAgent.hybrid_approach.services.thread_manager import thread_manager
 
 # Import agent tasks
 from hivataAgent.hybrid_approach.agents.question_agent import (
@@ -39,7 +41,7 @@ from hivataAgent.hybrid_approach.config.logging_config import logger
 def schedule_extraction_task(thread_id: str) -> None:
     """Schedule term extraction to be processed asynchronously."""
     logger.debug(f"Scheduling term extraction for thread_id: {thread_id}")
-    # Note: Uses the trigger_extraction_in_thread function to avoid circular references
+    # Uses the trigger_extraction_in_thread function which now leverages the thread manager
     trigger_extraction_in_thread(thread_id)
     return None
 
@@ -218,25 +220,31 @@ def process_user_answer(session_id: str, answer: str):
         raise
 
 def trigger_extraction_in_thread(thread_id: Optional[str] = None):
-    """Background thread function to trigger term extraction."""
-    def _run_extraction():
-        try:
-            logger.debug(f"Thread: Starting extraction thread for thread_id: {thread_id}")
-            time.sleep(0.5)  # Short delay
-            config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
-            
-            # Invoke the workflow with extract_terms action
-            workflow.invoke({"action": "extract_terms"}, config=config)
-            logger.debug(f"Thread: Extraction completed for thread_id: {thread_id}")
-        except Exception as e:
-            import traceback
-            logger.error(f"Thread: Error in extraction thread: {str(e)}")
-            logger.error(traceback.format_exc())
+    """Schedule term extraction to run asynchronously using the thread manager."""
+    logger.debug(f"Thread: Scheduling extraction for thread_id: {thread_id}")
     
-    # Create and start a new thread
-    extraction_thread = threading.Thread(target=_run_extraction)
-    extraction_thread.daemon = True
-    extraction_thread.start()
+    # Define the extraction function
+    def extraction_task():
+        logger.debug(f"Thread: Starting extraction process for thread_id: {thread_id}")
+        time.sleep(0.5)  # Short delay to ensure state is properly saved
+        config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
+        
+        # Invoke the workflow with extract_terms action
+        workflow.invoke({"action": "extract_terms"}, config=config)
+        logger.debug(f"Thread: Extraction completed for thread_id: {thread_id}")
+        return True
+    
+    # Schedule the task with the thread manager
+    task_id = thread_manager.schedule_task(
+        task_type="term_extraction",
+        task_fn=extraction_task
+    )
+    
+    if task_id:
+        logger.debug(f"Thread: Scheduled extraction task {task_id} for thread_id {thread_id}")
+    else:
+        logger.warning(f"Thread: Could not schedule extraction for thread_id {thread_id} - maximum threads reached")
+    
     return None
 
 def get_session_state(session_id: str):
