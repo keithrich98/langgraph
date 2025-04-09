@@ -183,17 +183,26 @@ def start_session():
     logger.info(f"Creating new session with thread_id: {thread_id}")
     
     try:
-        # Using entrypoint.final to separate API response from stored state
+        # Invoke the workflow and create an optimized response for API
         result = workflow.invoke(
             {"action": "start"}, 
             config={"configurable": {"thread_id": thread_id}}
         )
         logger.debug(f"Session started successfully: {thread_id}")
         
-        return {
+        # Get the current question using the helper function
+        from hivataAgent.hybrid_approach.core.state import get_formatted_current_question
+        current_question = get_formatted_current_question(result)
+        
+        # Create a clean API response that separates concerns from checkpoint state
+        api_response = {
             "session_id": thread_id,
-            **to_dict(result)
+            "current_question": current_question,
+            "conversation_history": result.conversation_history,
+            "is_complete": result.is_complete
         }
+        
+        return api_response
     except Exception as e:
         logger.error(f"Error starting session: {str(e)}", exc_info=True)
         raise
@@ -203,7 +212,7 @@ def process_user_answer(session_id: str, answer: str):
     logger.info(f"Processing user answer for session: {session_id}")
     
     try:
-        # Make sure thread_id is being passed correctly
+        # Invoke the workflow with answer action
         result = workflow.invoke(
             {"action": "answer", "answer": answer}, 
             config={"configurable": {"thread_id": session_id}}
@@ -211,10 +220,24 @@ def process_user_answer(session_id: str, answer: str):
         
         logger.debug(f"Answer processed for session {session_id}, is_complete: {result.is_complete}")
         
-        return {
+        # Get the current question using the helper function
+        from hivataAgent.hybrid_approach.core.state import get_formatted_current_question
+        current_question = get_formatted_current_question(result)
+        
+        # Create an optimized API response that includes only what the API needs
+        api_response = {
             "session_id": session_id,
-            **to_dict(result)
+            "current_question": current_question,
+            "conversation_history": result.conversation_history,
+            "is_complete": result.is_complete,
+            "verified_responses": result.verified_responses,
+            "verification_messages": result.verification_messages,
+            "verified_answers": result.verified_answers,
+            "extracted_terms": result.extracted_terms,
+            "term_extraction_queue": result.term_extraction_queue
         }
+        
+        return api_response
     except Exception as e:
         logger.error(f"Error processing answer for session {session_id}: {str(e)}", exc_info=True)
         raise
@@ -230,7 +253,7 @@ def trigger_extraction_in_thread(thread_id: Optional[str] = None):
         config = {"configurable": {"thread_id": thread_id}} if thread_id else {}
         
         # Invoke the workflow with extract_terms action
-        workflow.invoke({"action": "extract_terms"}, config=config)
+        result = workflow.invoke({"action": "extract_terms"}, config=config)
         logger.debug(f"Thread: Extraction completed for thread_id: {thread_id}")
         return True
     
@@ -263,10 +286,26 @@ def get_session_state(session_id: str):
         # Always use the values property for the state
         state_values = state.values if hasattr(state, 'values') else state
         
-        return {
+        # Get the current question using the helper function
+        from hivataAgent.hybrid_approach.core.state import get_formatted_current_question
+        current_question = get_formatted_current_question(state_values)
+        
+        # Create an optimized API response with only the necessary fields
+        api_response = {
             "session_id": session_id,
-            **to_dict(state_values)
+            "current_index": state_values.current_index,
+            "current_question": current_question,
+            "conversation_history": state_values.conversation_history,
+            "is_complete": state_values.is_complete,
+            "responses": state_values.responses,
+            "verified_responses": state_values.verified_responses,
+            "verification_messages": state_values.verification_messages,
+            "verified_answers": state_values.verified_answers,
+            "extracted_terms": state_values.extracted_terms,
+            "term_extraction_queue": state_values.term_extraction_queue
         }
+        
+        return api_response
     except Exception as e:
         logger.error(f"Error retrieving session state: {str(e)}", exc_info=True)
         return None

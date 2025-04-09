@@ -26,34 +26,63 @@
 - Created API endpoints to monitor thread/task status
 - Added smarter parsing strategies for extraction results
 
-## 5. Leverage entrypoint.final for API Responses ❌ (Not Started)
-- Not yet implemented
-- Would separate API responses from checkpoint state
-- Could provide more consistent API response format
-- Would improve checkpoint efficiency
+## 5. Optimize API Responses ✅ (Alternative Approach)
+- Implemented explicit API response formatting
+- Separates API responses from checkpoint state
+- Provides more consistent API response format
+- Improves checkpoint efficiency by including only needed fields
+- Reduces data transferred between client and server
+- Uses helper functions to retrieve properly formatted current questions
+
+## Implementation Details
+
+### Thread Manager
+- Created a singleton ThreadManager class in services/thread_manager.py
+- Provides centralized management of background threads
+- Tracks task status, history, and resource usage
+- Implements proper error handling and resource cleanup
+- Exposes monitoring capabilities
+
+### Enhanced Term Extraction
+- Added result caching to avoid redundant LLM calls
+- Implemented robust parsing with multiple fallback strategies
+- Added retry logic for failed LLM calls
+- Improved error handling to prevent task failures
+- Supports batch processing of extraction queue
+
+### API Improvements
+- Added new API endpoints for thread monitoring:
+  - GET /threads - Overview of thread manager status
+  - GET /threads/{task_id} - Status of specific task
+  - GET /threads/active - List of active tasks
+  - GET /threads/history - Historical task information
 
 ## Next Steps and Remaining Work
 
 ### Short Term
-1. Test the current implementation to verify serialization issues are fixed
-2. Document the approach taken and constraints encountered
-3. Update tests to work with the new state management
+1. Test the current implementation thoroughly
+2. Document the new thread manager approach
+3. Consider updating tests to cover the new functionality
 
 ### Medium Term
-1. Re-evaluate task composition to better use LangGraph patterns without serialization issues
-2. Implement entrypoint.final for API responses
+1. ✅ Optimize API responses (implemented custom approach for consistent API formatting)
+2. Explore better ways to use LangGraph's async patterns without serialization issues
 3. Enhance error handling with more specific exception types
-4. Improve logging for better debugging
+4. Add task prioritization to the thread manager
+5. Consider upgrading to newer LangGraph version with entrypoint.final support in the future
 
 ### Long Term
-1. Move toward a more declarative graph definition
-2. Explore LangGraph's node-based architecture
-3. Consider implementing proper state-based edge determination
+1. Consider replacing the thread manager with a proper task queue for production
+2. Move toward a more declarative graph definition
+3. Explore LangGraph's node-based architecture
 4. Evaluate alternative persistence strategies
 
 ## Lessons Learned
 - Serialization is a key concern when using stateful checkpointing
 - Future objects from @task decorators are not serializable by default
 - Pydantic provides good validation and immutability guarantees
-- LangGraph's functional API has a learning curve but provides clear benefits
-- Balance is needed between adopting framework patterns and practical implementation
+- Centralized thread management improves visibility and control
+- Proper caching and error handling significantly improve robustness
+- Balance is needed between framework patterns and practical implementation
+- API responses should be explicitly formatted rather than directly exposing state objects
+- Helper functions should be used to derive computed properties from state
