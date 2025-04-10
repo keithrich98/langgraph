@@ -33,3 +33,9 @@ This project implements a questionnaire system using LangGraph:
 - Asynchronous term extraction with proper thread management
 - FastAPI endpoints for RESTful API access
 - Comprehensive logging with context and state information
+
+## Current Tasks
+- Need to create term extraction functionality by creating a new term_extractor.py agent
+- Reference hivataAgent/superAgentGraph/term_extractor_func.py as a guide
+- Must update parent_workflow.py using only the langgraph.graph API (not langgraph.func)
+- Implement asynchronous orchestration of the term_extractor agent with the extract_node function

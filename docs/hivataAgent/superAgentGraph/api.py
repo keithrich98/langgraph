@@ -129,7 +129,10 @@ def start_session():
             "term_extraction_queue": [],
             "extracted_terms": {},
             "last_extracted_index": -1,
-            "verification_result": {}
+            "verification_result": {},
+            # Include thread_id in state for term extraction
+            "thread_id": thread_id,
+            "trigger_extraction": False
         }
         logger.debug(f"Created initial state: {initial_state}")
         
@@ -146,6 +149,10 @@ def start_session():
         logger.debug(f"Current state attributes: {dir(current_state)}")
         logger.debug(f"Current state values type: {type(current_state.values)}")
         logger.debug(f"Current state values keys: {current_state.values.keys() if hasattr(current_state.values, 'keys') else 'No keys method'}")
+        
+        # IMPORTANT: Explicitly save the state to our memory saver to ensure background
+        # processes can access it
+        sync_state_to_memory_saver(thread_id, current_state.values)
         
         # Check if waiting for input
         waiting_for_input = False
@@ -195,14 +202,40 @@ def start_session():
 def next_step(req: NextRequest):
     """Process the user's answer and return the next question."""
     logger.debug(f"Processing next step for session: {req.session_id}")
-    config = {"configurable": {"thread_id": req.session_id}}
+    thread_id = req.session_id
+    config = {"configurable": {"thread_id": thread_id}}
     
     try:
+        # Get the current state to update the thread_id
+        current_state = graph.get_state(config)
+        state_values = current_state.values
+        
+        # Check if thread_id is already in the state
+        has_thread_id = state_values.get('thread_id') is not None
+        
+        # If thread_id isn't in state, add it before continuing
+        if not has_thread_id:
+            logger.debug(f"Adding thread_id {thread_id} to state before invoking graph")
+            # We need to include the thread_id in the state for background term extraction
+            # Create a command that will update the state with the thread_id
+            update_cmd = {"thread_id": thread_id}
+            # Apply the update before resuming
+            graph.invoke(update_cmd, config)
+            
+            # Get the updated state and explicitly save it to our memory saver
+            updated_after_thread_id = graph.get_state(config)
+            sync_state_to_memory_saver(thread_id, updated_after_thread_id.values)
+        
         # Resume execution with the user's answer
         graph.invoke(Command(resume=req.answer), config)
         
         # Get the updated state
         updated_state = graph.get_state(config)
+        
+        # IMPORTANT: Explicitly save the state to our memory saver to ensure background
+        # processes can access it
+        state_values = updated_state.values
+        sync_state_to_memory_saver(thread_id, state_values)
         
         # Check if waiting for input
         waiting_for_input = False
@@ -215,7 +248,6 @@ def next_step(req: NextRequest):
         finished = not waiting_for_input and not updated_state.next
         
         # Get conversation history and current question
-        state_values = updated_state.values
         # Use get() method since state_values is a dictionary
         raw_conversation_history = state_values.get('conversation_history', [])
         
@@ -224,7 +256,13 @@ def next_step(req: NextRequest):
         
         current_question = get_current_question(raw_conversation_history)
         
-        logger.debug(f"Next step processed, waiting_for_input: {waiting_for_input}, finished: {finished}")
+        # Debug log additional information for troubleshooting
+        logger.debug(f"Next step processed with thread_id: {thread_id}")
+        logger.debug(f"Thread ID stored in state: {state_values.get('thread_id')}")
+        logger.debug(f"Waiting for input: {waiting_for_input}, finished: {finished}")
+        logger.debug(f"Current term_extraction_queue: {state_values.get('term_extraction_queue', [])}")
+        logger.debug(f"Current extracted_terms: {list(state_values.get('extracted_terms', {}).keys())}")
+        logger.debug(f"Current state keys: {list(state_values.keys())}")
         
         return NextResponse(
             conversation_history=conversation_history,
@@ -237,6 +275,140 @@ def next_step(req: NextRequest):
         logger.error(f"Error processing answer: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error processing answer: {str(e)}")
+
+def sync_state_to_memory_saver(thread_id, state_values):
+    """
+    Ensure the state is explicitly saved to our memory saver.
+    This bridges the gap between LangGraph's internal state and our custom memory saver.
+    """
+    from parent_workflow import shared_memory
+    
+    try:
+        logger.debug(f"Syncing state with thread_id {thread_id} to memory saver")
+        
+        import copy
+        state_copy = copy.deepcopy(state_values)  # changed from dict comprehension to deep copy
+        
+        shared_memory.save(thread_id, state_copy)
+        
+        test_load = shared_memory.load(thread_id)
+        if test_load:
+            queue = test_load.get('term_extraction_queue', [])
+            terms = test_load.get('extracted_terms', {})
+            logger.debug(f"State sync verified - Queue: {queue}, Terms: {list(terms.keys())}")
+        else:
+            logger.warning("State sync verification failed - loaded state is empty")
+    except Exception as e:
+        logger.error(f"Error syncing state to memory saver: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+class TermsResponse(BaseModel):
+    """Response model for terms extraction."""
+    terms: Dict[int, List[str]]
+    pending_extraction: List[int]
+    
+@app.get("/terms/{session_id}", response_model=TermsResponse)
+def get_extracted_terms(session_id: str):
+    """
+    Retrieve extracted terms for a session.
+    This endpoint simply returns the current state without triggering extraction.
+    Extraction is now handled automatically in the background via threading.
+    """
+    logger.debug(f"Retrieving extracted terms for session: {session_id}")
+    config = {"configurable": {"thread_id": session_id}}
+    
+    try:
+        # Get direct access to the memory saver to debug internal state
+        from parent_workflow import shared_memory
+        
+        # Debug the internal state of memory_saver
+        raw_states = getattr(shared_memory, "_states", {})
+        if session_id in raw_states:
+            logger.debug(f"DEBUG: Direct memory saver access - session_id found in _states")
+            direct_state = raw_states[session_id]
+            if direct_state and 'extracted_terms' in direct_state:
+                direct_terms = direct_state['extracted_terms']
+                logger.debug(f"DEBUG: Direct extracted_terms: {direct_terms}")
+                logger.debug(f"DEBUG: Direct terms keys: {list(direct_terms.keys())}")
+        else:
+            logger.debug(f"DEBUG: Direct memory saver access - session_id NOT found in _states")
+            logger.debug(f"DEBUG: Available session IDs in memory saver: {list(raw_states.keys())}")
+        
+        # Try to load state from memory saver
+        memory_state = shared_memory.load(session_id)
+        
+        # If memory_state exists and has extracted terms, use that data
+        if memory_state and 'extracted_terms' in memory_state:
+            logger.debug(f"Using state from memory_saver for session {session_id}")
+            extracted_terms = memory_state.get('extracted_terms', {})
+            term_extraction_queue = memory_state.get('term_extraction_queue', [])
+            
+            # Log detailed information about extracted terms
+            logger.debug(f"Found extracted_terms dict: {extracted_terms}")
+            if extracted_terms:
+                logger.debug(f"Found extracted terms with keys: {list(extracted_terms.keys())}")
+                for k, v in extracted_terms.items():
+                    logger.debug(f"Terms for index {k}: {v[:3] if len(v) > 3 else v}... (total: {len(v)})")
+            else:
+                logger.warning(f"extracted_terms is empty or not properly formatted: {extracted_terms}")
+                
+            # Debug all keys in the state for troubleshooting
+            logger.debug(f"All keys in memory state: {list(memory_state.keys())}")
+            if 'last_extracted_index' in memory_state:
+                logger.debug(f"last_extracted_index: {memory_state['last_extracted_index']}")
+        else:
+            logger.warning(f"No valid state found in memory_saver for session {session_id}")
+            # Fall back to getting state from graph
+            current_state = graph.get_state(config)
+            state_values = current_state.values
+            
+            # Extract the terms and pending extraction queue
+            extracted_terms = state_values.get('extracted_terms', {})
+            term_extraction_queue = state_values.get('term_extraction_queue', [])
+            
+            # Sync the state to our memory saver for future use
+            sync_state_to_memory_saver(session_id, state_values)
+            
+            # After syncing, try to get the direct state again for verification
+            memory_state = shared_memory.load(session_id)
+            if memory_state and 'extracted_terms' in memory_state:
+                logger.debug(f"After sync, extracted_terms: {memory_state.get('extracted_terms', {})}")
+        
+        # Direct access to internal state for debugging
+        if hasattr(shared_memory, "_states") and session_id in shared_memory._states:
+            direct_extracted_terms = shared_memory._states[session_id].get('extracted_terms', {})
+            if direct_extracted_terms:
+                logger.debug(f"Using direct access to _states - extracted_terms found with keys: {list(direct_extracted_terms.keys())}")
+                # Use the direct access results if available
+                extracted_terms = direct_extracted_terms
+        
+        # Ensure all keys in extracted_terms are strings (for JSON compatibility)
+        normalized_terms = {}
+        for k, v in extracted_terms.items():
+            normalized_terms[str(k)] = v
+        
+        # Ensure term_extraction_queue items are integers
+        try:
+            normalized_queue = [int(item) for item in term_extraction_queue]
+        except (TypeError, ValueError):
+            logger.warning(f"Could not convert all queue items to integers, using as-is: {term_extraction_queue}")
+            normalized_queue = term_extraction_queue
+        
+        logger.info(f"Current extraction status - Queue: {normalized_queue}, Extracted terms: {list(normalized_terms.keys())}")
+        logger.info(f"Terms content sample: {next(iter(normalized_terms.values()), [])[:3] if normalized_terms else []}")
+        
+        # Just return the current state - extraction happens automatically in the background
+        return TermsResponse(
+            terms=normalized_terms,
+            pending_extraction=normalized_queue
+        )
+    except Exception as e:
+        logger.error(f"Error retrieving extracted terms: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error retrieving extracted terms: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
