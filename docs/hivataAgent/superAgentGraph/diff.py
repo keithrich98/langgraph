@@ -1,414 +1,469 @@
-# api.py with HIL API
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-from uuid import uuid4
-from typing import Dict, Optional, List, Any
-import uvicorn
-
-# Import our graph and ChatState from parent_workflow.py
-from parent_workflow import graph, ChatState, init_node
-from langgraph.types import Command  # Import Command for resuming execution
+# parent_workflow.py - Simplified using graph API and interrupt with accumulated history and improved logging
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt
+from langchain_core.messages import AIMessage, HumanMessage
+from shared_memory import shared_memory
 from logging_config import logger
+from answer_verifier import verify_answer
+from question_processor import get_questions
+from typing import Dict, Literal
+from state import ChatState, init_state
+from utils import convert_messages, get_logging_context,format_question_prompt  # Shared utility for message conversion
 
-app = FastAPI()
 
-# Configure CORS for frontend connectivity
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class StartResponse(BaseModel):
-    session_id: str
-    conversation_history: List[Dict[str, str]]
-    current_question: str
-    waiting_for_input: bool
-
-class NextRequest(BaseModel):
-    session_id: str
-    answer: str
-
-class NextResponse(BaseModel):
-    conversation_history: List[Dict[str, str]]
-    current_question: Optional[str] = None
-    finished: bool
-    waiting_for_input: bool
-
-def convert_messages_to_dict(messages):
+# --- Node 1: init_node ---
+def init_node(state: ChatState) -> ChatState:
     """
-    Convert LangChain message objects to dictionaries.
-    
-    Ensures consistent conversion from various message formats to a standardized dict format.
-    Handles both objects with attributes and dictionary-style messages.
-    
-    Args:
-        messages: A list of message objects (AIMessage, HumanMessage, dict, etc.)
-        
-    Returns:
-        list: A list of dicts with 'role' and 'content' keys
+    Initializes the state with the questions and resets the conversation.
+    Uses init_state() from state.py to build the base state.
     """
-    result = []
-    if not messages:
-        return result
+    try:
+        logger.info("Initializing questionnaire state.", extra={"thread_id": state.get("thread_id")})
+        questions = get_questions()
+        logger.debug(f"Loaded {len(questions)} questions.", extra={"thread_id": state.get("thread_id")})
+    except Exception as e:
+        logger.error(f"Error loading questions: {str(e)}", extra={"thread_id": state.get("thread_id")})
+        raise
+
+    thread_id = state.get("thread_id")
+    # Create the base state using the centralized initializer.
+    new_state = init_state(thread_id)
+    # Populate the questions field.
+    new_state["questions"] = questions
+    return new_state
+
+# --- Node 2: ask_node ---
+def ask_node(state: ChatState) -> Dict:
+    idx = state["current_question_index"]
+    context = get_logging_context(state, extra={"function": "ask_node"})
+    try:
+        logger.info(f"Preparing question index {idx}.", extra=context)
+        if idx >= len(state["questions"]):
+            logger.info("No more questions; marking session as complete.", extra=context)
+            return {"is_complete": True}
+
+        question_obj = state["questions"][idx]
+        prompt = format_question_prompt(question_obj)
+        logger.debug("Formatted question prompt.", extra=context)
+
+        delta_history = [AIMessage(content=prompt)]
+        logger.info(f"Returning delta with {len(delta_history)} new message(s).", extra=context)
+    except Exception as e:
+        logger.error(f"Error in ask_node for question index {idx}: {str(e)}", extra=context)
+        raise
+
+    if state.get("term_extraction_queue"):
+        logger.info(f"Pending extraction tasks: {state['term_extraction_queue']}.", extra=context)
+    return {"conversation_history": delta_history}
+
+# --- Node 3: answer_node ---
+def answer_node(state: ChatState) -> dict:
+    idx = state["current_question_index"]
+    context = get_logging_context(state, extra={"function": "answer_node"})
+    try:
+        logger.info(f"Waiting for user answer for question index {idx}.", extra=context)
+        user_answer = interrupt({"prompt": "Please provide your answer:", "question_index": idx})
+    except Exception as e:
+        logger.error(f"Error during interrupt in answer_node for question index {idx}: {str(e)}", extra=context)
+        raise
+    logger.info(f"Received answer: {user_answer[:30]}...", extra=context)
+    delta_history = [HumanMessage(content=user_answer)]
+    logger.debug(f"Delta history length: {len(delta_history)}", extra=context)
+    return {
+        "conversation_history": delta_history,
+        "responses": {**state["responses"], idx: user_answer}
+    }
+
+# --- Node 4: verification_node ---
+def verification_node(state: ChatState) -> dict:
+    idx = state["current_question_index"]
+    context = get_logging_context(state, extra={"function": "verification_node"})
+    try:
+        logger.info(f"Processing verification for question index {idx}.", extra=context)
+        conv_history_dicts = convert_messages(state["conversation_history"])
+        logger.debug(f"Full conversation history length: {len(conv_history_dicts)}", extra=context)
+    except Exception as e:
+        logger.error(f"Error converting conversation history for question index {idx}: {str(e)}", extra=context)
+        raise
+    try:
+        verification_result = verify_answer(state["questions"][idx], state["responses"].get(idx, ""), conv_history_dicts)
+        verification_message = verification_result["verification_message"]
+        is_valid = verification_result["is_valid"]
+        logger.info(f"Verification outcome: is_valid={is_valid}.", extra=context)
+    except Exception as e:
+        logger.error(f"Error during verification for question index {idx}: {str(e)}", extra=context)
+        raise
+
+    delta_history = [AIMessage(content=verification_message)]
+    logger.info("Appending verification message to conversation history.", extra=context)
+    return {
+        "conversation_history": delta_history,
+        "verification_result": {
+            "action": "verified_answer",
+            "question_index": idx,
+            "answer": state["responses"].get(idx, ""),
+            "verification_message": verification_message,
+            "is_valid": is_valid
+        }
+    }
+
+# --- Node 5: process_extraction_in_background ---
+def process_extraction_in_background(thread_id: str, idx: int, memory_saver, current_state=None):
+    """
+    Process extraction in a background thread outside the graph flow.
+    """
+    context = {"thread_id": thread_id, "question_index": idx, "function": "process_extraction_in_background"}
+    try:
+        import time, copy
+        time.sleep(0.5)
+        logger.info(f"Background extraction started for index {idx}.", extra=context)
+
+        if hasattr(memory_saver, "_states"):
+            logger.debug(f"DEBUG: Memory saver states before extraction: {list(memory_saver._states.keys())}", extra={"thread_id": thread_id})
+            if thread_id in memory_saver._states:
+                logger.debug(f"DEBUG: thread_id {thread_id} exists in memory_saver._states", extra={"thread_id": thread_id})
         
-    for msg in messages:
-        # Handle dict-style messages
-        if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
-            # Already in the right format
-            result.append(msg.copy())  # Use copy to avoid mutating original
-            continue
-            
-        # Handle message objects with attributes
-        if hasattr(msg, 'content'):
-            content = msg.content
-            
-            # Determine the role with fallbacks
-            if hasattr(msg, 'type'):
-                role = msg.type.lower()
-            elif hasattr(msg, '_message_type'):
-                msg_type = msg._message_type.lower() if hasattr(msg, '_message_type') else ''
-                if 'ai' in msg_type or 'assistant' in msg_type:
-                    role = 'ai'
-                elif 'human' in msg_type or 'user' in msg_type:
-                    role = 'human'
+        state_loaded = current_state if current_state is not None else memory_saver.load(thread_id)
+        if not state_loaded:
+            logger.error(f"No state found for thread_id {thread_id}.", extra=context)
+            return
+        logger.info(f"Background extraction using state with keys: {list(state_loaded.keys())}", extra=context)
+        logger.debug(f"DEBUG: Initial extracted_terms: {state_loaded.get('extracted_terms')}", extra=context)
+        
+        if idx not in state_loaded.get("term_extraction_queue", []):
+            logger.warning(f"Item {idx} not in extraction queue - queue: {state_loaded.get('term_extraction_queue', [])}", extra=context)
+            return
+        if idx not in state_loaded.get("verified_answers", {}):
+            logger.error(f"No verified answer found for index {idx}.", extra=context)
+            return
+        
+        verified_item = state_loaded["verified_answers"][idx]
+        question = verified_item.get("question", "")
+        answer = verified_item.get("answer", "")
+        from term_extractor import extract_terms
+        terms = extract_terms(question, answer)
+        
+        latest_state = memory_saver.load(thread_id)
+        if not latest_state:
+            logger.warning("Could not load latest state before update, using original state.", extra=context)
+            latest_state = state_loaded
+        
+        new_queue = [i for i in latest_state.get("term_extraction_queue", []) if i != idx]
+        current_terms = latest_state.get("extracted_terms", {})
+        if not isinstance(current_terms, dict):
+            logger.warning(f"extracted_terms is not a dictionary: {current_terms}. Creating new dictionary.", extra=context)
+            current_terms = {}
+        
+        str_idx = str(idx)
+        updated_terms = {str(k): v for k, v in current_terms.items()}
+        updated_terms[str_idx] = terms
+        
+        updated_state = copy.deepcopy(latest_state)
+        updated_state["term_extraction_queue"] = new_queue
+        updated_state["extracted_terms"] = updated_terms
+        updated_state["last_extracted_index"] = idx
+        
+        logger.debug(f"DEBUG: About to save state with keys: {list(updated_state.keys())}", extra=context)
+        logger.debug(f"DEBUG: extracted_terms keys: {list(updated_state['extracted_terms'].keys())}", extra=context)
+        logger.info(f"Saving extraction results for index {idx}: {terms[:3] if len(terms) > 3 else terms} (total: {len(terms)} terms)", extra=context)
+        
+        memory_saver.save(thread_id, updated_state)
+        verification_state = memory_saver.load(thread_id)
+        if verification_state:
+            if "extracted_terms" in verification_state:
+                extracted_terms = verification_state["extracted_terms"]
+                logger.debug(f"DEBUG: Verification - extracted_terms keys: {list(extracted_terms.keys())}", extra=context)
+                if str_idx in extracted_terms:
+                    logger.info(f"Verified successful save of {len(extracted_terms[str_idx])} terms for index {idx}", extra=context)
                 else:
-                    role = 'ai'  # Default fallback
+                    logger.warning(f"Terms for index {idx} not found in saved state.", extra=context)
             else:
-                # Try to infer from class name
-                class_name = msg.__class__.__name__.lower()
-                if 'ai' in class_name or 'assistant' in class_name:
-                    role = 'ai'
-                elif 'human' in class_name or 'user' in class_name:
-                    role = 'human'
-                else:
-                    role = 'ai'  # Default fallback
-                    
-            result.append({"role": role, "content": content})
-            continue
-            
-        # Log any unhandled message types
-        logger.warning(f"Unhandled message type: {type(msg)}")
+                logger.warning("No extracted_terms key in verification state.", extra=context)
+        else:
+            logger.error("Could not verify state save - failed to load for verification.", extra=context)
         
-    logger.debug(f"Converted {len(messages)} messages to {len(result)} dict messages")
+        logger.info(f"Background extraction completed for index {idx}, found {len(terms)} terms.", extra=context)
+    except Exception as e:
+        logger.error(f"Background extraction error at index {idx}: {str(e)}", extra=context)
+        import traceback
+        logger.error(traceback.format_exc(), extra=context)
+
+def process_answer_node(state: ChatState) -> dict:
+    try:
+        idx = state["current_question_index"]
+        context = get_logging_context(state, extra={"function": "process_answer_node"})
+        logger.info(f"Processing answer for question index {idx}.", extra=context)
+        
+        verification_result = state.get("verification_result", {})
+        if not verification_result or not verification_result.get("is_valid", False):
+            logger.warning("Verification failed; re-prompting answer.", extra=context)
+            return {}
+        
+        answer = verification_result.get("answer", "")
+        verified_answers = {**state["verified_answers"]}
+        verified_answers[idx] = {
+            "question": state["questions"][idx]["text"],
+            "answer": answer,
+            "verification": verification_result.get("verification_message", "")
+        }
+        logger.debug(f"Updated verified_answers: {verified_answers}", extra=context)
+        
+        term_extraction_queue = state["term_extraction_queue"].copy()
+        if idx not in term_extraction_queue:
+            term_extraction_queue.append(idx)
+            logger.debug(f"Added index {idx} to extraction queue: {term_extraction_queue}", extra=context)
+            thread_state = {**state, "verified_answers": verified_answers, "term_extraction_queue": term_extraction_queue}
+            if state.get("thread_id"):
+                try:
+                    import threading
+                    logger.info(f"Launching background extraction for index {idx} with thread_id {state.get('thread_id')}.", extra=context)
+                    extraction_thread = threading.Thread(
+                        target=lambda: process_extraction_in_background(state.get("thread_id"), idx, shared_memory, current_state=thread_state),
+                        daemon=True
+                    )
+                    extraction_thread.start()
+                    logger.info(f"Started background extraction for index {idx}.", extra=context)
+                except Exception as e:
+                    logger.error(f"Error launching background extraction for index {idx}: {str(e)}", extra=context)
+        
+        new_index = idx + 1
+        updates = {
+            "current_question_index": new_index,
+            "verified_answers": verified_answers,
+            "term_extraction_queue": term_extraction_queue
+        }
+        
+        if new_index >= len(state["questions"]):
+            updates["is_complete"] = True
+            delta_history = [AIMessage(content="Thank you for completing all the questions. Your responses have been recorded.")]
+            updates["conversation_history"] = delta_history
+            logger.info("All questions complete.", extra=context)
+        
+        # Recompute context after updating question index
+        new_context = get_logging_context(state, extra={"function": "process_answer_node", "question_index": new_index})
+        logger.info(f"Advancing to question index {new_index}.", extra=new_context)
+        return updates
+
+    except Exception as ex:
+        logger.error(f"Unexpected error: {str(ex)}", extra=get_logging_context(state, extra={"function": "process_answer_node"}))
+        raise
+
+# --- Node 6: extract_node ---
+def extract_node(state: ChatState) -> Dict:
+    """
+    Initiates asynchronous term extraction from verified answers.
+    Processes items in the term extraction queue without blocking the main workflow.
+    Delegates the actual extraction to a background thread.
+    """
+    thread_id = state.get("thread_id")
+    context = get_logging_context(state, extra={"function": "extract_node"})
+    try:
+        logger.info("Processing term extraction queue.", extra=context)
+        logger.info(f"Current term_extraction_queue: {state.get('term_extraction_queue')}", extra=context)
+    except Exception as e:
+        logger.error(f"Error logging extraction queue: {str(e)}", extra=context)
+    
+    if not state.get("term_extraction_queue"):
+        logger.info("No items in extraction queue.", extra=context)
+        return {}
+    
+    try:
+        idx = state["term_extraction_queue"][0]
+        context = get_logging_context(state, extra={"function": "extract_node", "question_index": idx})
+        logger.info(f"Starting extraction for question index {idx}.", extra=context)
+    except Exception as e:
+        logger.error(f"Error retrieving index from extraction queue: {str(e)}", extra=context)
+        return {}
+    
+    if idx in state.get("verified_answers", {}):
+        logger.info(f"Found verified answer for index {idx}.", extra=context)
+    else:
+        logger.warning(f"No verified answer found for index {idx}. Removing index from queue.", extra=context)
+        term_extraction_queue = [i for i in state.get("term_extraction_queue", []) if i != idx]
+        return {"term_extraction_queue": term_extraction_queue}
+    
+    # Attempt thread_id retrieval via multiple methods for redundancy
+    try:
+        if thread_id:
+            logger.info(f"Retrieved thread_id from state directly: {thread_id}", extra={"function": "extract_node", "question_index": idx})
+        if not thread_id and hasattr(memory, 'parent_config') and hasattr(memory.parent_config, 'configurable'):
+            thread_id = memory.parent_config.configurable.get('thread_id')
+            logger.info(f"Retrieved thread_id from memory.parent_config: {thread_id}", extra={"question_index": idx})
+        if not thread_id:
+            try:
+                if hasattr(state, 'config') and hasattr(state.config, 'configurable'):
+                    thread_id = state.config.configurable.get('thread_id')
+                    logger.info(f"Retrieved thread_id from state.config: {thread_id}", extra={"question_index": idx})
+            except Exception as e:
+                logger.error(f"Error getting thread_id from state.config: {str(e)}", extra={"question_index": idx})
+        if not thread_id:
+            try:
+                if hasattr(memory, '_threads') and memory._threads:
+                    latest_thread_id = list(memory._threads.keys())[-1]
+                    thread_id = latest_thread_id
+                    logger.info(f"Retrieved thread_id from memory._threads: {thread_id}", extra={"question_index": idx})
+            except Exception as e:
+                logger.error(f"Error getting thread_id from memory._threads: {str(e)}", extra={"question_index": idx})
+    except Exception as e:
+        logger.error(f"Error during thread_id retrieval: {str(e)}", extra=context)
+    
+    if not thread_id:
+        logger.error("Cannot start async extraction - thread_id not available.", extra=context)
+        logger.info("Falling back to synchronous extraction.", extra=context)
+        return extract_node_sync(state)
+    
+    try:
+        success = start_extraction_thread(state, idx, thread_id, memory)
+    except Exception as e:
+        logger.error(f"Exception when starting extraction thread for index {idx}: {str(e)}", extra={"thread_id": thread_id, "question_index": idx})
+        success = False
+    
+    if success:
+        logger.info(f"Async extraction started for index {idx}.", extra={"thread_id": thread_id, "question_index": idx})
+        term_extraction_queue = [i for i in state.get("term_extraction_queue", []) if i != idx]
+        return {"term_extraction_queue": term_extraction_queue}
+    else:
+        logger.error(f"Failed to start async extraction for index {idx}.", extra={"thread_id": thread_id, "question_index": idx})
+        logger.info("Falling back to synchronous extraction.", extra={"thread_id": thread_id, "question_index": idx})
+        return extract_node_sync(state)
+
+# --- Alternate synchronous implementation ---
+# This implementation processes extractions synchronously for testing or fallback
+def extract_node_sync(state: ChatState) -> Dict:
+    """
+    Synchronous term extraction processing - fallback implementation.
+    """
+    from term_extractor import extract_terms
+    context = get_logging_context(state, extra={"function": "extract_node_sync"})
+    logger.info("Running synchronous term extraction.", extra=context)
+    
+    if not state.get("term_extraction_queue"):
+        return {}
+    
+    idx = state["term_extraction_queue"][0]
+    context = get_logging_context(state, extra={"function": "extract_node_sync", "question_index": idx})
+    logger.debug(f"Processing extraction for index {idx}.", extra=context)
+    
+    if idx in state.get("verified_answers", {}):
+        verified_item = state["verified_answers"][idx]
+        question = verified_item.get("question", "")
+        answer = verified_item.get("answer", "")
+        terms = extract_terms(question, answer)
+        extracted_terms = {**state.get("extracted_terms", {})}
+        term_extraction_queue = state.get("term_extraction_queue", []).copy()
+        extracted_terms[idx] = terms
+        try:
+            term_extraction_queue.remove(idx)
+        except Exception as e:
+            logger.warning(f"Could not remove index {idx} from extraction queue: {str(e)}", 
+                           extra=get_logging_context(state, extra={"function": "extract_node_sync", "question_index": idx}))
+        logger.info(f"Extraction complete for index {idx}, found {len(terms)} terms.", extra=context)
+        return {
+            "extracted_terms": extracted_terms,
+            "term_extraction_queue": term_extraction_queue,
+            "last_extracted_index": idx
+        }
+    else:
+        logger.warning(f"Index {idx} not found in verified_answers.", extra=context)
+        return {}
+
+# --- Node 7: end_node ---
+def end_node(state: ChatState) -> Dict:
+    """
+    Final node that marks the questionnaire session as complete.
+    """
+    context = get_logging_context(state, extra={"function": "end_node"})
+    logger.info("Finalizing state and marking session complete.", extra=context)
+    return {"is_complete": True}
+
+# --- Define routing logic ---
+def verification_result_router(state: ChatState) -> Literal["process_answer_node", "answer_node"]:
+    context = get_logging_context(state, extra={"function": "verification_result_router"})
+    result = "process_answer_node" if state.get("verification_result", {}).get("is_valid", False) else "answer_node"
+    logger.info(f"Routing to {result}.", extra=context)
     return result
 
-def get_current_question(conversation_history: List) -> str:
-    """Extract the latest AI message from the conversation history."""
-    # First convert any message objects to dictionaries
-    dict_history = convert_messages_to_dict(conversation_history)
-    
-    # Then extract the last AI message
-    for msg in reversed(dict_history):
-        if msg.get("role") == "ai":
-            content = msg.get("content", "")
-            return content if isinstance(content, str) else str(content)
-    return ""
+def process_answer_router(state: ChatState) -> Literal["ask_node", "extract_node", "end_node"]:
+    context = get_logging_context(state, extra={"function": "process_answer_router"})
+    if state.get("trigger_extraction", False) and state.get("term_extraction_queue"):
+        logger.info(f"Extraction trigger detected with queue: {state['term_extraction_queue']}", extra=context)
+        state["trigger_extraction"] = False
+        return "extract_node"
+    if state["current_question_index"] >= len(state["questions"]):
+        logger.info("No more questions, routing to end_node.", extra=context)
+        if state.get("term_extraction_queue"):
+            logger.info(f"Extraction queue present at end: {state['term_extraction_queue']}", extra=context)
+            return "extract_node"
+        return "end_node"
+    logger.info(f"Proceeding to next question {state['current_question_index']}.", extra=context)
+    return "ask_node"
 
-@app.post("/start", response_model=StartResponse)
-def start_session():
-    """Start a new questionnaire session."""
-    # Generate a unique thread ID
-    thread_id = str(uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    try:
-        logger.debug(f"Starting new session with thread_id: {thread_id}")
-        
-        # Initialize with minimal required state
-        initial_state = {
-            "current_question_index": 0,
-            "questions": [],
-            "conversation_history": [],
-            "responses": {},
-            "is_complete": False,
-            "verified_answers": {},
-            "term_extraction_queue": [],
-            "extracted_terms": {},
-            "last_extracted_index": -1,
-            "verification_result": {},
-            # Include thread_id in state for term extraction
-            "thread_id": thread_id,
-            "trigger_extraction": False
-        }
-        logger.debug(f"Created initial state: {initial_state}")
-        
-        # Run the graph until it hits the first interrupt
-        logger.debug("About to invoke graph")
-        result = graph.invoke(initial_state, config)
-        logger.debug(f"Graph invoke result type: {type(result)}")
-        logger.debug(f"Graph invoke result: {result}")
-        
-        # Get the current state
-        logger.debug("Getting current state")
-        current_state = graph.get_state(config)
-        logger.debug(f"Current state type: {type(current_state)}")
-        logger.debug(f"Current state attributes: {dir(current_state)}")
-        logger.debug(f"Current state values type: {type(current_state.values)}")
-        logger.debug(f"Current state values keys: {current_state.values.keys() if hasattr(current_state.values, 'keys') else 'No keys method'}")
-        
-        # IMPORTANT: Explicitly save the state to our memory saver to ensure background
-        # processes can access it
-        sync_state_to_memory_saver(thread_id, current_state.values)
-        
-        # Check if waiting for input
-        waiting_for_input = False
-        if current_state.tasks and len(current_state.tasks) > 0:
-            task = current_state.tasks[0]
-            logger.debug(f"Task: {task}")
-            if hasattr(task, 'interrupts') and task.interrupts:
-                waiting_for_input = True
-        
-        # Get conversation history
-        state_values = current_state.values
-        logger.debug(f"State values: {state_values}")
-        
-        # Try different ways to access conversation history
-        raw_conversation_history = []
-        if isinstance(state_values, dict):
-            logger.debug("State values is a dict, using get method")
-            raw_conversation_history = state_values.get('conversation_history', [])
-        elif hasattr(state_values, 'conversation_history'):
-            logger.debug("State values has conversation_history attribute")
-            raw_conversation_history = state_values.conversation_history
-        else:
-            logger.debug("Couldn't find conversation_history, using empty list")
-        
-        # Convert message objects to dictionaries
-        conversation_history = convert_messages_to_dict(raw_conversation_history)
-        logger.debug(f"Converted conversation history: {conversation_history}")
-        
-        # Get the current question
-        current_question = get_current_question(raw_conversation_history)
-        
-        logger.debug(f"Session started successfully, conversation history length: {len(conversation_history)}")
-        
-        return StartResponse(
-            session_id=thread_id,
-            conversation_history=conversation_history,
-            current_question=current_question,
-            waiting_for_input=waiting_for_input
-        )
-    except Exception as e:
-        import traceback
-        logger.error(f"Error starting session: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Error starting session: {str(e)}")
+def extract_router(state: ChatState) -> Literal["extract_node", "end_node"]:
+    context = get_logging_context(state, extra={"function": "extract_router"})
+    if state.get("term_extraction_queue"):
+        logger.info(f"Routing to extract_node with queue: {state['term_extraction_queue']}", extra=context)
+        return "extract_node"
+    logger.info("No items in extraction queue, routing to end_node.", extra=context)
+    return "end_node"
 
-@app.post("/next", response_model=NextResponse)
-def next_step(req: NextRequest):
-    """Process the user's answer and return the next question."""
-    logger.debug(f"Processing next step for session: {req.session_id}")
-    thread_id = req.session_id
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    try:
-        # Get the current state to update the thread_id
-        current_state = graph.get_state(config)
-        state_values = current_state.values
-        
-        # Check if thread_id is already in the state
-        has_thread_id = state_values.get('thread_id') is not None
-        
-        # If thread_id isn't in state, add it before continuing
-        if not has_thread_id:
-            logger.debug(f"Adding thread_id {thread_id} to state before invoking graph")
-            # We need to include the thread_id in the state for background term extraction
-            # Create a command that will update the state with the thread_id
-            update_cmd = {"thread_id": thread_id}
-            # Apply the update before resuming
-            graph.invoke(update_cmd, config)
-            
-            # Get the updated state and explicitly save it to our memory saver
-            updated_after_thread_id = graph.get_state(config)
-            sync_state_to_memory_saver(thread_id, updated_after_thread_id.values)
-        
-        # Resume execution with the user's answer
-        graph.invoke(Command(resume=req.answer), config)
-        
-        # Get the updated state
-        updated_state = graph.get_state(config)
-        
-        # IMPORTANT: Explicitly save the state to our memory saver to ensure background
-        # processes can access it
-        state_values = updated_state.values
-        sync_state_to_memory_saver(thread_id, state_values)
-        
-        # Check if waiting for input
-        waiting_for_input = False
-        if updated_state.tasks and len(updated_state.tasks) > 0:
-            task = updated_state.tasks[0]
-            if hasattr(task, 'interrupts') and task.interrupts:
-                waiting_for_input = True
-        
-        # Check if finished
-        finished = not waiting_for_input and not updated_state.next
-        
-        # Get conversation history and current question
-        # Use get() method since state_values is a dictionary
-        raw_conversation_history = state_values.get('conversation_history', [])
-        
-        # Convert message objects to dictionaries
-        conversation_history = convert_messages_to_dict(raw_conversation_history)
-        
-        current_question = get_current_question(raw_conversation_history)
-        
-        # Debug log additional information for troubleshooting
-        logger.debug(f"Next step processed with thread_id: {thread_id}")
-        logger.debug(f"Thread ID stored in state: {state_values.get('thread_id')}")
-        logger.debug(f"Waiting for input: {waiting_for_input}, finished: {finished}")
-        logger.debug(f"Current term_extraction_queue: {state_values.get('term_extraction_queue', [])}")
-        logger.debug(f"Current extracted_terms: {list(state_values.get('extracted_terms', {}).keys())}")
-        logger.debug(f"Current state keys: {list(state_values.keys())}")
-        
-        return NextResponse(
-            conversation_history=conversation_history,
-            current_question=current_question,
-            finished=finished,
-            waiting_for_input=waiting_for_input
-        )
-    except Exception as e:
-        import traceback
-        logger.error(f"Error processing answer: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Error processing answer: {str(e)}")
+# --- Node 8: tasks_checker ---
+def tasks_checker(state: ChatState) -> Dict:
+    context = get_logging_context(state, extra={"function": "tasks_checker"})
+    logger.info("Checking for pending background tasks.", extra=context)
+    if state.get("term_extraction_queue"):
+        logger.info(f"Found pending extraction tasks: {state['term_extraction_queue']}", extra=context)
+    return {}
 
-def sync_state_to_memory_saver(thread_id, state_values):
-    """
-    Ensure the state is explicitly saved to our memory saver.
-    This bridges the gap between LangGraph's internal state and our custom memory saver.
-    """
-    from parent_workflow import shared_memory
-    
-    try:
-        logger.debug(f"Syncing state with thread_id {thread_id} to memory saver")
-        
-        import copy
-        state_copy = copy.deepcopy(state_values)  # changed from dict comprehension to deep copy
-        
-        shared_memory.save(thread_id, state_copy)
-        
-        test_load = shared_memory.load(thread_id)
-        if test_load:
-            queue = test_load.get('term_extraction_queue', [])
-            terms = test_load.get('extracted_terms', {})
-            logger.debug(f"State sync verified - Queue: {queue}, Terms: {list(terms.keys())}")
-        else:
-            logger.warning("State sync verification failed - loaded state is empty")
-    except Exception as e:
-        logger.error(f"Error syncing state to memory saver: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-class TermsResponse(BaseModel):
-    """Response model for terms extraction."""
-    terms: Dict[int, List[str]]
-    pending_extraction: List[int]
-    
-@app.get("/terms/{session_id}", response_model=TermsResponse)
-def get_extracted_terms(session_id: str):
-    """
-    Retrieve extracted terms for a session.
-    This endpoint simply returns the current state without triggering extraction.
-    Extraction is now handled automatically in the background via threading.
-    """
-    logger.debug(f"Retrieving extracted terms for session: {session_id}")
-    config = {"configurable": {"thread_id": session_id}}
-    
-    try:
-        # Get direct access to the memory saver to debug internal state
-        from parent_workflow import shared_memory
-        
-        # Debug the internal state of memory_saver
-        raw_states = getattr(shared_memory, "_states", {})
-        if session_id in raw_states:
-            logger.debug(f"DEBUG: Direct memory saver access - session_id found in _states")
-            direct_state = raw_states[session_id]
-            if direct_state and 'extracted_terms' in direct_state:
-                direct_terms = direct_state['extracted_terms']
-                logger.debug(f"DEBUG: Direct extracted_terms: {direct_terms}")
-                logger.debug(f"DEBUG: Direct terms keys: {list(direct_terms.keys())}")
-        else:
-            logger.debug(f"DEBUG: Direct memory saver access - session_id NOT found in _states")
-            logger.debug(f"DEBUG: Available session IDs in memory saver: {list(raw_states.keys())}")
-        
-        # Try to load state from memory saver
-        memory_state = shared_memory.load(session_id)
-        
-        # If memory_state exists and has extracted terms, use that data
-        if memory_state and 'extracted_terms' in memory_state:
-            logger.debug(f"Using state from memory_saver for session {session_id}")
-            extracted_terms = memory_state.get('extracted_terms', {})
-            term_extraction_queue = memory_state.get('term_extraction_queue', [])
-            
-            # Log detailed information about extracted terms
-            logger.debug(f"Found extracted_terms dict: {extracted_terms}")
-            if extracted_terms:
-                logger.debug(f"Found extracted terms with keys: {list(extracted_terms.keys())}")
-                for k, v in extracted_terms.items():
-                    logger.debug(f"Terms for index {k}: {v[:3] if len(v) > 3 else v}... (total: {len(v)})")
-            else:
-                logger.warning(f"extracted_terms is empty or not properly formatted: {extracted_terms}")
-                
-            # Debug all keys in the state for troubleshooting
-            logger.debug(f"All keys in memory state: {list(memory_state.keys())}")
-            if 'last_extracted_index' in memory_state:
-                logger.debug(f"last_extracted_index: {memory_state['last_extracted_index']}")
-        else:
-            logger.warning(f"No valid state found in memory_saver for session {session_id}")
-            # Fall back to getting state from graph
-            current_state = graph.get_state(config)
-            state_values = current_state.values
-            
-            # Extract the terms and pending extraction queue
-            extracted_terms = state_values.get('extracted_terms', {})
-            term_extraction_queue = state_values.get('term_extraction_queue', [])
-            
-            # Sync the state to our memory saver for future use
-            sync_state_to_memory_saver(session_id, state_values)
-            
-            # After syncing, try to get the direct state again for verification
-            memory_state = shared_memory.load(session_id)
-            if memory_state and 'extracted_terms' in memory_state:
-                logger.debug(f"After sync, extracted_terms: {memory_state.get('extracted_terms', {})}")
-        
-        # Direct access to internal state for debugging
-        if hasattr(shared_memory, "_states") and session_id in shared_memory._states:
-            direct_extracted_terms = shared_memory._states[session_id].get('extracted_terms', {})
-            if direct_extracted_terms:
-                logger.debug(f"Using direct access to _states - extracted_terms found with keys: {list(direct_extracted_terms.keys())}")
-                # Use the direct access results if available
-                extracted_terms = direct_extracted_terms
-        
-        # Ensure all keys in extracted_terms are strings (for JSON compatibility)
-        normalized_terms = {}
-        for k, v in extracted_terms.items():
-            normalized_terms[str(k)] = v
-        
-        # Ensure term_extraction_queue items are integers
-        try:
-            normalized_queue = [int(item) for item in term_extraction_queue]
-        except (TypeError, ValueError):
-            logger.warning(f"Could not convert all queue items to integers, using as-is: {term_extraction_queue}")
-            normalized_queue = term_extraction_queue
-        
-        logger.info(f"Current extraction status - Queue: {normalized_queue}, Extracted terms: {list(normalized_terms.keys())}")
-        logger.info(f"Terms content sample: {next(iter(normalized_terms.values()), [])[:3] if normalized_terms else []}")
-        
-        # Just return the current state - extraction happens automatically in the background
-        return TermsResponse(
-            terms=normalized_terms,
-            pending_extraction=normalized_queue
-        )
-    except Exception as e:
-        logger.error(f"Error retrieving extracted terms: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Error retrieving extracted terms: {str(e)}")
+# --- Routing for task checking ---
+def tasks_checker_router(state: ChatState) -> Literal["answer_node"]:
+    return "answer_node"
 
+# --- Node 9: trigger_extraction_node ---
+def trigger_extraction_node(state: ChatState) -> Dict:
+    context = get_logging_context(state, extra={"function": "trigger_extraction_node"})
+    logger.info("Called to handle extraction trigger.", extra=context)
+    if state.get("trigger_extraction", False):
+        logger.info("Trigger detected, will process extraction queue.", extra=context)
+        return {}
+    else:
+        logger.info("No trigger detected.", extra=context)
+        return {}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# --- Routing for trigger extraction ---
+def trigger_extraction_router(state: ChatState) -> Literal["process_answer_node"]:
+    """Always route to process_answer_node to handle the trigger."""
+    return "process_answer_node"
+
+# --- Build the Graph ---
+builder = StateGraph(ChatState)
+
+# Add all nodes
+builder.add_node("init_node", init_node)
+builder.add_node("ask_node", ask_node)
+builder.add_node("tasks_checker", tasks_checker)  # Monitoring node
+builder.add_node("answer_node", answer_node)
+builder.add_node("verification_node", verification_node)
+builder.add_node("process_answer_node", process_answer_node)
+builder.add_node("extract_node", extract_node)
+builder.add_node("trigger_extraction_node", trigger_extraction_node)  # New trigger node
+builder.add_node("end_node", end_node)
+
+# Set up edges
+builder.add_edge(START, "init_node")
+builder.add_edge("init_node", "ask_node")
+# Insert tasks_checker between ask_node and answer_node to log pending tasks
+builder.add_edge("ask_node", "tasks_checker")
+builder.add_conditional_edges("tasks_checker", tasks_checker_router)
+builder.add_edge("answer_node", "verification_node")
+builder.add_conditional_edges("verification_node", verification_result_router)
+# Add direct entry point for extraction triggering
+builder.add_edge("trigger_extraction_node", "process_answer_node")
+builder.add_conditional_edges("process_answer_node", process_answer_router)
+builder.add_conditional_edges("extract_node", extract_router)
+builder.add_edge("end_node", END)
+
+# Create a checkpointer for persistence from shared_memory (already an instance)
+memory = shared_memory
+
+# Compile the graph with the checkpointer
+graph = builder.compile(checkpointer=memory)

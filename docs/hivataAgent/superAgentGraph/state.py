@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Annotated
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 
+PartialChatState = Dict[str, Any]
+
 class ChatState(TypedDict):
     current_question_index: int
     questions: List[Dict]

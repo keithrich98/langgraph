@@ -6,8 +6,9 @@ from shared_memory import shared_memory
 from logging_config import logger
 from answer_verifier import verify_answer
 from question_processor import get_questions
+from term_extractor import extract_terms
 from typing import Dict, Literal
-from state import ChatState, init_state
+from state import ChatState, init_state, PartialChatState
 from utils import convert_messages, get_logging_context,format_question_prompt  # Shared utility for message conversion
 
 
@@ -25,15 +26,14 @@ def init_node(state: ChatState) -> ChatState:
         logger.error(f"Error loading questions: {str(e)}", extra={"thread_id": state.get("thread_id")})
         raise
 
-    thread_id = state.get("thread_id")
     # Create the base state using the centralized initializer.
-    new_state = init_state(thread_id)
+    new_state = init_state(state["thread_id"])
     # Populate the questions field.
     new_state["questions"] = questions
     return new_state
 
 # --- Node 2: ask_node ---
-def ask_node(state: ChatState) -> Dict:
+def ask_node(state: ChatState) -> PartialChatState:
     idx = state["current_question_index"]
     context = get_logging_context(state, extra={"function": "ask_node"})
     try:
@@ -57,7 +57,7 @@ def ask_node(state: ChatState) -> Dict:
     return {"conversation_history": delta_history}
 
 # --- Node 3: answer_node ---
-def answer_node(state: ChatState) -> dict:
+def answer_node(state: ChatState) -> PartialChatState:
     idx = state["current_question_index"]
     context = get_logging_context(state, extra={"function": "answer_node"})
     try:
@@ -75,7 +75,7 @@ def answer_node(state: ChatState) -> dict:
     }
 
 # --- Node 4: verification_node ---
-def verification_node(state: ChatState) -> dict:
+def verification_node(state: ChatState) -> PartialChatState:
     idx = state["current_question_index"]
     context = get_logging_context(state, extra={"function": "verification_node"})
     try:
@@ -107,88 +107,8 @@ def verification_node(state: ChatState) -> dict:
         }
     }
 
-# --- Node 5: process_extraction_in_background ---
-def process_extraction_in_background(thread_id: str, idx: int, memory_saver, current_state=None):
-    """
-    Process extraction in a background thread outside the graph flow.
-    """
-    context = {"thread_id": thread_id, "question_index": idx, "function": "process_extraction_in_background"}
-    try:
-        import time, copy
-        time.sleep(0.5)
-        logger.info(f"Background extraction started for index {idx}.", extra=context)
-
-        if hasattr(memory_saver, "_states"):
-            logger.debug(f"DEBUG: Memory saver states before extraction: {list(memory_saver._states.keys())}", extra={"thread_id": thread_id})
-            if thread_id in memory_saver._states:
-                logger.debug(f"DEBUG: thread_id {thread_id} exists in memory_saver._states", extra={"thread_id": thread_id})
-        
-        state_loaded = current_state if current_state is not None else memory_saver.load(thread_id)
-        if not state_loaded:
-            logger.error(f"No state found for thread_id {thread_id}.", extra=context)
-            return
-        logger.info(f"Background extraction using state with keys: {list(state_loaded.keys())}", extra=context)
-        logger.debug(f"DEBUG: Initial extracted_terms: {state_loaded.get('extracted_terms')}", extra=context)
-        
-        if idx not in state_loaded.get("term_extraction_queue", []):
-            logger.warning(f"Item {idx} not in extraction queue - queue: {state_loaded.get('term_extraction_queue', [])}", extra=context)
-            return
-        if idx not in state_loaded.get("verified_answers", {}):
-            logger.error(f"No verified answer found for index {idx}.", extra=context)
-            return
-        
-        verified_item = state_loaded["verified_answers"][idx]
-        question = verified_item.get("question", "")
-        answer = verified_item.get("answer", "")
-        from term_extractor import extract_terms
-        terms = extract_terms(question, answer)
-        
-        latest_state = memory_saver.load(thread_id)
-        if not latest_state:
-            logger.warning("Could not load latest state before update, using original state.", extra=context)
-            latest_state = state_loaded
-        
-        new_queue = [i for i in latest_state.get("term_extraction_queue", []) if i != idx]
-        current_terms = latest_state.get("extracted_terms", {})
-        if not isinstance(current_terms, dict):
-            logger.warning(f"extracted_terms is not a dictionary: {current_terms}. Creating new dictionary.", extra=context)
-            current_terms = {}
-        
-        str_idx = str(idx)
-        updated_terms = {str(k): v for k, v in current_terms.items()}
-        updated_terms[str_idx] = terms
-        
-        updated_state = copy.deepcopy(latest_state)
-        updated_state["term_extraction_queue"] = new_queue
-        updated_state["extracted_terms"] = updated_terms
-        updated_state["last_extracted_index"] = idx
-        
-        logger.debug(f"DEBUG: About to save state with keys: {list(updated_state.keys())}", extra=context)
-        logger.debug(f"DEBUG: extracted_terms keys: {list(updated_state['extracted_terms'].keys())}", extra=context)
-        logger.info(f"Saving extraction results for index {idx}: {terms[:3] if len(terms) > 3 else terms} (total: {len(terms)} terms)", extra=context)
-        
-        memory_saver.save(thread_id, updated_state)
-        verification_state = memory_saver.load(thread_id)
-        if verification_state:
-            if "extracted_terms" in verification_state:
-                extracted_terms = verification_state["extracted_terms"]
-                logger.debug(f"DEBUG: Verification - extracted_terms keys: {list(extracted_terms.keys())}", extra=context)
-                if str_idx in extracted_terms:
-                    logger.info(f"Verified successful save of {len(extracted_terms[str_idx])} terms for index {idx}", extra=context)
-                else:
-                    logger.warning(f"Terms for index {idx} not found in saved state.", extra=context)
-            else:
-                logger.warning("No extracted_terms key in verification state.", extra=context)
-        else:
-            logger.error("Could not verify state save - failed to load for verification.", extra=context)
-        
-        logger.info(f"Background extraction completed for index {idx}, found {len(terms)} terms.", extra=context)
-    except Exception as e:
-        logger.error(f"Background extraction error at index {idx}: {str(e)}", extra=context)
-        import traceback
-        logger.error(traceback.format_exc(), extra=context)
-
-def process_answer_node(state: ChatState) -> dict:
+# --- Node 5: process_answer_node ---
+def process_answer_node(state: ChatState) -> PartialChatState:
     try:
         idx = state["current_question_index"]
         context = get_logging_context(state, extra={"function": "process_answer_node"})
@@ -248,8 +168,89 @@ def process_answer_node(state: ChatState) -> dict:
         logger.error(f"Unexpected error: {str(ex)}", extra=get_logging_context(state, extra={"function": "process_answer_node"}))
         raise
 
-# --- Node 6: extract_node ---
-def extract_node(state: ChatState) -> Dict:
+# --- Node 6: process_extraction_in_background ---
+def process_extraction_in_background(thread_id: str, idx: int, memory_saver, current_state=None):
+    """
+    Process extraction in a background thread outside the graph flow.
+    """
+    context = {"thread_id": thread_id, "question_index": idx, "function": "process_extraction_in_background"}
+    try:
+        import time, copy
+        time.sleep(0.5)
+        logger.info(f"Background extraction started for index {idx}.", extra=context)
+
+        if hasattr(memory_saver, "_states"):
+            logger.debug(f"DEBUG: Memory saver states before extraction: {list(memory_saver._states.keys())}", extra={"thread_id": thread_id})
+            if thread_id in memory_saver._states:
+                logger.debug(f"DEBUG: thread_id {thread_id} exists in memory_saver._states", extra={"thread_id": thread_id})
+        
+        state_loaded = current_state if current_state is not None else memory_saver.load(thread_id)
+        if not state_loaded:
+            logger.error(f"No state found for thread_id {thread_id}.", extra=context)
+            return
+        logger.info(f"Background extraction using state with keys: {list(state_loaded.keys())}", extra=context)
+        logger.debug(f"DEBUG: Initial extracted_terms: {state_loaded.get('extracted_terms')}", extra=context)
+        
+        if idx not in state_loaded.get("term_extraction_queue", []):
+            logger.warning(f"Item {idx} not in extraction queue - queue: {state_loaded.get('term_extraction_queue', [])}", extra=context)
+            return
+        if idx not in state_loaded.get("verified_answers", {}):
+            logger.error(f"No verified answer found for index {idx}.", extra=context)
+            return
+        
+        verified_item = state_loaded["verified_answers"][idx]
+        question = verified_item.get("question", "")
+        answer = verified_item.get("answer", "")
+        terms = extract_terms(question, answer)
+        
+        latest_state = memory_saver.load(thread_id)
+        if not latest_state:
+            logger.warning("Could not load latest state before update, using original state.", extra=context)
+            latest_state = state_loaded
+        
+        new_queue = [i for i in latest_state.get("term_extraction_queue", []) if i != idx]
+        current_terms = latest_state.get("extracted_terms", {})
+        if not isinstance(current_terms, dict):
+            logger.warning(f"extracted_terms is not a dictionary: {current_terms}. Creating new dictionary.", extra=context)
+            current_terms = {}
+        
+        str_idx = str(idx)
+        updated_terms = {str(k): v for k, v in current_terms.items()}
+        updated_terms[str_idx] = terms
+        
+        updated_state = copy.deepcopy(latest_state)
+        updated_state["term_extraction_queue"] = new_queue
+        updated_state["extracted_terms"] = updated_terms
+        updated_state["last_extracted_index"] = idx
+        
+        logger.debug(f"DEBUG: About to save state with keys: {list(updated_state.keys())}", extra=context)
+        logger.debug(f"DEBUG: extracted_terms keys: {list(updated_state['extracted_terms'].keys())}", extra=context)
+        logger.info(f"Saving extraction results for index {idx}: {terms[:3] if len(terms) > 3 else terms} (total: {len(terms)} terms)", extra=context)
+        
+        memory_saver.save(thread_id, updated_state)
+        verification_state = memory_saver.load(thread_id)
+        if verification_state:
+            if "extracted_terms" in verification_state:
+                extracted_terms = verification_state["extracted_terms"]
+                logger.debug(f"DEBUG: Verification - extracted_terms keys: {list(extracted_terms.keys())}", extra=context)
+                if str_idx in extracted_terms:
+                    logger.info(f"Verified successful save of {len(extracted_terms[str_idx])} terms for index {idx}", extra=context)
+                else:
+                    logger.warning(f"Terms for index {idx} not found in saved state.", extra=context)
+            else:
+                logger.warning("No extracted_terms key in verification state.", extra=context)
+        else:
+            logger.error("Could not verify state save - failed to load for verification.", extra=context)
+        
+        logger.info(f"Background extraction completed for index {idx}, found {len(terms)} terms.", extra=context)
+    except Exception as e:
+        logger.error(f"Background extraction error at index {idx}: {str(e)}", extra=context)
+        import traceback
+        logger.error(traceback.format_exc(), extra=context)
+
+
+# --- Node 7: extract_node ---
+def extract_node(state: ChatState) -> PartialChatState:
     """
     Initiates asynchronous term extraction from verified answers.
     Processes items in the term extraction queue without blocking the main workflow.
@@ -329,11 +330,10 @@ def extract_node(state: ChatState) -> Dict:
 
 # --- Alternate synchronous implementation ---
 # This implementation processes extractions synchronously for testing or fallback
-def extract_node_sync(state: ChatState) -> Dict:
+def extract_node_sync(state: ChatState) -> PartialChatState:
     """
     Synchronous term extraction processing - fallback implementation.
     """
-    from term_extractor import extract_terms
     context = get_logging_context(state, extra={"function": "extract_node_sync"})
     logger.info("Running synchronous term extraction.", extra=context)
     
