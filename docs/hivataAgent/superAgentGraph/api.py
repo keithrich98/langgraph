@@ -11,6 +11,7 @@ from parent_workflow import graph, ChatState, init_node
 from langgraph.types import Command
 from logging_config import logger
 from utils import convert_messages, get_logging_context
+from state import ChatState, init_state
 from fastapi.responses import JSONResponse
 
 # FastAPI application initialization.
@@ -85,20 +86,7 @@ async def start_session():
     config = {"configurable": {"thread_id": thread_id}}
     try:
         logger.debug(f"Starting new session with thread_id: {thread_id}")
-        initial_state: ChatState = {
-            "current_question_index": 0,
-            "questions": [],
-            "conversation_history": [],
-            "responses": {},
-            "is_complete": False,
-            "verified_answers": {},
-            "term_extraction_queue": [],
-            "extracted_terms": {},
-            "last_extracted_index": -1,
-            "verification_result": {},
-            "thread_id": thread_id,
-            "trigger_extraction": False
-        }
+        initial_state: ChatState = init_state(thread_id)
         logger.debug(f"Created initial state: {initial_state}")
         
         # Invoke graph until it hits the first interrupt.

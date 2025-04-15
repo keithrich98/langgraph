@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from logging_config import logger
 from langchain_openai import ChatOpenAI
+from state import ChatState
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -151,20 +152,20 @@ def verify_answer(
         logger.error(f"Error in verification: {str(e)}")
         return {"is_valid": False, "verification_message": f"There was an error verifying your answer: {str(e)}"}
 
-def verification_node(state: Dict) -> Dict:
+def verification_node(state: ChatState) -> Dict:
     """
     Graph node for verifying user answers.
     Updates state with verification results.
     (This node is kept for reference.)
     """
-    idx = state["current_question_index"]
+    idx = state.current_question_index
     logger.debug(f"Verification node for question index {idx}")
     
-    answer = state["responses"].get(idx, "")
+    answer = state.responses.get(idx, "")
     logger.debug(f"Verifying answer: {answer[:30]}...")
     
-    current_question = state["questions"][idx]
-    verification_result = verify_answer(current_question, answer, state["conversation_history"])
+    current_question = state.questions[idx]
+    verification_result = verify_answer(current_question, answer, state.conversation_history)
     verification_message = verification_result["verification_message"]
     is_valid = verification_result["is_valid"]
     

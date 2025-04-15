@@ -10,26 +10,11 @@ This module provides:
 """
 
 from typing import Dict, List, Literal, Any, Optional
-from typing import Annotated
-from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict  # Corrected import
 from langchain_core.messages import AIMessage, HumanMessage
+from state import ChatState
 from logging_config import logger
 
-# --- Define the ChatState Schema ---
-class ChatState(TypedDict):
-    current_question_index: int
-    questions: List[Dict]
-    conversation_history: Annotated[List, add_messages]
-    responses: Dict[int, str]
-    is_complete: bool
-    verified_answers: Dict[int, Dict[str, str]]
-    term_extraction_queue: List[int]
-    extracted_terms: Dict[int, List[str]]
-    last_extracted_index: int
-    verification_result: Dict[str, Any]
-    thread_id: Optional[str]
-    trigger_extraction: bool
+
 
 def get_message_role(m: Any) -> str:
     """

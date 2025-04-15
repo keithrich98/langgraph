@@ -7,6 +7,7 @@ import json
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
 from logging_config import logger
+from state import ChatState
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
@@ -120,7 +121,7 @@ def extract_terms(question: str, answer: str) -> List[str]:
         logger.error(f"Error in term extraction: {str(e)}")
         return ["ERROR: Term extraction failed"]
 
-def extract_terms_async(state: Dict, idx: int) -> Dict:
+def extract_terms_async(state: ChatState, idx: int) -> Dict:
     """
     Asynchronously extract medical terms for a given question index.
     

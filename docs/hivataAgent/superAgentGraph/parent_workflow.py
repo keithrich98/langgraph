@@ -7,13 +7,15 @@ from logging_config import logger
 from answer_verifier import verify_answer
 from question_processor import get_questions
 from typing import Dict, Literal
-from utils import convert_messages, get_logging_context,format_question_prompt, ChatState  # Shared utility for message conversion
+from state import ChatState, init_state
+from utils import convert_messages, get_logging_context,format_question_prompt  # Shared utility for message conversion
 
 
 # --- Node 1: init_node ---
-def init_node(state: ChatState) -> Dict:
+def init_node(state: ChatState) -> ChatState:
     """
     Initializes the state with the questions and resets the conversation.
+    Uses init_state() from state.py to build the base state.
     """
     try:
         logger.info("Initializing questionnaire state.", extra={"thread_id": state.get("thread_id")})
@@ -24,22 +26,11 @@ def init_node(state: ChatState) -> Dict:
         raise
 
     thread_id = state.get("thread_id")
-    logger.debug(f"Initializing with thread_id: {thread_id}", extra={"thread_id": thread_id})
-    
-    return {
-        "questions": questions,
-        "current_question_index": 0,
-        "conversation_history": [],
-        "responses": {},
-        "is_complete": False,
-        "verified_answers": {},
-        "term_extraction_queue": [],
-        "extracted_terms": {},
-        "last_extracted_index": -1,
-        "verification_result": {},
-        "thread_id": thread_id,
-        "trigger_extraction": False
-    }
+    # Create the base state using the centralized initializer.
+    new_state = init_state(thread_id)
+    # Populate the questions field.
+    new_state["questions"] = questions
+    return new_state
 
 # --- Node 2: ask_node ---
 def ask_node(state: ChatState) -> Dict:
