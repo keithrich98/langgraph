@@ -1,55 +1,35 @@
 # parent_workflow.py - Simplified using graph API and interrupt with accumulated history and improved logging
-from typing import Dict, List, Literal, Any, Optional
-from typing_extensions import TypedDict  # Corrected import
-from typing import Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
-from langgraph.graph.message import add_messages
 from langchain_core.messages import AIMessage, HumanMessage
 from shared_memory import shared_memory
 from logging_config import logger
 from answer_verifier import verify_answer
 from question_processor import get_questions
+from typing import Dict, Literal
+from utils import convert_messages, get_logging_context,format_question_prompt, ChatState  # Shared utility for message conversion
 
-# --- Define the ChatState Schema ---
-class ChatState(TypedDict):
-    # Core state fields
-    current_question_index: int
-    questions: List[Dict]
-    # Use the add_messages reducer so that new updates are appended to the history.
-    conversation_history: Annotated[List, add_messages]
-    responses: Dict[int, str]
-    is_complete: bool
-    
-    # Fields for verification and term extraction
-    verified_answers: Dict[int, Dict[str, str]]
-    term_extraction_queue: List[int]
-    extracted_terms: Dict[int, List[str]]
-    last_extracted_index: int
-    verification_result: Dict[str, Any]
-    
-    # Configuration fields
-    thread_id: Optional[str]  # Thread tracking - Do not use double underscore to avoid name mangling
-    trigger_extraction: bool   # Flag to trigger extraction processing
 
 # --- Node 1: init_node ---
 def init_node(state: ChatState) -> Dict:
     """
     Initializes the state with the questions and resets the conversation.
     """
-    logger.info("Initializing questionnaire state.")
-    questions = get_questions()
-    logger.debug(f"Loaded {len(questions)} questions.")
+    try:
+        logger.info("Initializing questionnaire state.", extra={"thread_id": state.get("thread_id")})
+        questions = get_questions()
+        logger.debug(f"Loaded {len(questions)} questions.", extra={"thread_id": state.get("thread_id")})
+    except Exception as e:
+        logger.error(f"Error loading questions: {str(e)}", extra={"thread_id": state.get("thread_id")})
+        raise
+
+    thread_id = state.get("thread_id")
+    logger.debug(f"Initializing with thread_id: {thread_id}", extra={"thread_id": thread_id})
     
-    # Get thread_id from state if it exists (should have been passed from API)
-    thread_id = state.get("thread_id") if hasattr(state, "get") else None
-    logger.debug(f"Initializing with thread_id: {thread_id}")
-    
-    # Start with an empty conversation history
     return {
         "questions": questions,
         "current_question_index": 0,
-        "conversation_history": [],  # Empty; subsequent updates will be appended
+        "conversation_history": [],
         "responses": {},
         "is_complete": False,
         "verified_answers": {},
@@ -63,123 +43,68 @@ def init_node(state: ChatState) -> Dict:
 
 # --- Node 2: ask_node ---
 def ask_node(state: ChatState) -> Dict:
-    """
-    Appends the current question (with requirements) to the conversation history.
-    Returns only the new message so that the add_messages reducer appends it.
-    """
     idx = state["current_question_index"]
-    logger.info(f"ask_node: Preparing question index {idx}.")
-    if idx >= len(state["questions"]):
-        logger.info("No more questions; marking session as complete.")
-        return {"is_complete": True}
+    context = get_logging_context(state, extra={"function": "ask_node"})
+    try:
+        logger.info(f"Preparing question index {idx}.", extra=context)
+        if idx >= len(state["questions"]):
+            logger.info("No more questions; marking session as complete.", extra=context)
+            return {"is_complete": True}
 
-    question_obj = state["questions"][idx]
-    formatted_requirements = "\n".join([f"- {k}: {v}" for k, v in question_obj["requirements"].items()])
-    prompt = f"{question_obj['text']}\n\nRequirements:\n{formatted_requirements}"
-    logger.debug("ask_node: Formatted question prompt.")
-    
-    # Return only the new AI message as the update.
-    delta_history = [AIMessage(content=prompt)]
-    logger.info(f"ask_node: Returning delta with {len(delta_history)} new message(s).")
-    
-    # Also log if there are pending extraction tasks, for debugging
-    if state["term_extraction_queue"]:
-        logger.info(f"ask_node: Note - there are pending extraction tasks: {state['term_extraction_queue']}")
-    
+        question_obj = state["questions"][idx]
+        prompt = format_question_prompt(question_obj)
+        logger.debug("Formatted question prompt.", extra=context)
+
+        delta_history = [AIMessage(content=prompt)]
+        logger.info(f"Returning delta with {len(delta_history)} new message(s).", extra=context)
+    except Exception as e:
+        logger.error(f"Error in ask_node for question index {idx}: {str(e)}", extra=context)
+        raise
+
+    if state.get("term_extraction_queue"):
+        logger.info(f"Pending extraction tasks: {state['term_extraction_queue']}.", extra=context)
     return {"conversation_history": delta_history}
 
-# --- Node 4: answer_node ---
+# --- Node 3: answer_node ---
 def answer_node(state: ChatState) -> dict:
-    """
-    Obtains the user's answer via an interrupt and returns only the new human message.
-    """
     idx = state["current_question_index"]
-    logger.info(f"answer_node: Waiting for user answer for question index {idx}.")
-    
-    # Note: The 'interrupt' function raises GraphInterrupt to pause the graph.
-    user_answer = interrupt({"prompt": "Please provide your answer:", "question_index": idx})
-    logger.info(f"answer_node: Received answer: {user_answer[:30]}...")
-    
-    # Return only the new human message.
+    context = get_logging_context(state, extra={"function": "answer_node"})
+    try:
+        logger.info(f"Waiting for user answer for question index {idx}.", extra=context)
+        user_answer = interrupt({"prompt": "Please provide your answer:", "question_index": idx})
+    except Exception as e:
+        logger.error(f"Error during interrupt in answer_node for question index {idx}: {str(e)}", extra=context)
+        raise
+    logger.info(f"Received answer: {user_answer[:30]}...", extra=context)
     delta_history = [HumanMessage(content=user_answer)]
-    logger.debug(f"answer_node: Delta history length: {len(delta_history)}")
-    
+    logger.debug(f"Delta history length: {len(delta_history)}", extra=context)
     return {
         "conversation_history": delta_history,
         "responses": {**state["responses"], idx: user_answer}
     }
 
-# --- Node 3: verification_node ---
-def convert_messages(messages: list) -> list:
-    """
-    Converts a list of message objects to dictionaries.
-    Takes any combination of dict messages, AIMessage, HumanMessage, etc.,
-    and converts them all to a consistent dict format.
-    """
-    logger.debug(f"Converting {len(messages)} message(s) to dict format.")
-    result = []
-    for m in messages:
-        if isinstance(m, dict) and 'role' in m and 'content' in m:
-            # Already in the right format
-            result.append(m.copy())
-        else:
-            # Try various ways to extract role and content
-            try:
-                if hasattr(m, 'content'):
-                    content = m.content
-                    
-                    # Determine the role
-                    if hasattr(m, 'type'):
-                        role = m.type.lower()
-                    elif hasattr(m, '_message_type'):
-                        msg_type = m._message_type.lower()
-                        if 'ai' in msg_type or 'assistant' in msg_type:
-                            role = 'ai'
-                        elif 'human' in msg_type or 'user' in msg_type:
-                            role = 'human'
-                        else:
-                            role = 'ai'  # Default fallback
-                    else:
-                        # Try to infer from class name
-                        class_name = m.__class__.__name__.lower()
-                        if 'ai' in class_name or 'assistant' in class_name:
-                            role = 'ai'
-                        elif 'human' in class_name or 'user' in class_name:
-                            role = 'human'
-                        else:
-                            role = 'ai'  # Default fallback
-                            
-                    result.append({"role": role, "content": content})
-                else:
-                    logger.warning(f"Couldn't convert message to dict format: {m}")
-            except Exception as e:
-                logger.error(f"Error converting message: {e}")
-                
-    logger.debug(f"Converted messages: {result}")
-    return result
-
+# --- Node 4: verification_node ---
 def verification_node(state: ChatState) -> dict:
-    """
-    Verifies the user's answer using the LLM.
-    Appends the verification message to the conversation history.
-    Ensures that verification has access to the complete conversation history.
-    """
     idx = state["current_question_index"]
-    logger.info(f"verification_node: Processing verification for question index {idx}.")
-    
-    # Convert the FULL conversation history, not just deltas
-    conv_history_dicts = convert_messages(state["conversation_history"])
-    logger.debug(f"verification_node: Full conversation history length: {len(conv_history_dicts)}")
-    
-    verification_result = verify_answer(state["questions"][idx], state["responses"].get(idx, ""), conv_history_dicts)
-    verification_message = verification_result["verification_message"]
-    is_valid = verification_result["is_valid"]
-    logger.info(f"verification_node: Verification outcome: is_valid={is_valid}.")
-    
-    # The add_messages reducer will append this to the existing history
+    context = get_logging_context(state, extra={"function": "verification_node"})
+    try:
+        logger.info(f"Processing verification for question index {idx}.", extra=context)
+        conv_history_dicts = convert_messages(state["conversation_history"])
+        logger.debug(f"Full conversation history length: {len(conv_history_dicts)}", extra=context)
+    except Exception as e:
+        logger.error(f"Error converting conversation history for question index {idx}: {str(e)}", extra=context)
+        raise
+    try:
+        verification_result = verify_answer(state["questions"][idx], state["responses"].get(idx, ""), conv_history_dicts)
+        verification_message = verification_result["verification_message"]
+        is_valid = verification_result["is_valid"]
+        logger.info(f"Verification outcome: is_valid={is_valid}.", extra=context)
+    except Exception as e:
+        logger.error(f"Error during verification for question index {idx}: {str(e)}", extra=context)
+        raise
+
     delta_history = [AIMessage(content=verification_message)]
-    logger.info(f"verification_node: Appending verification message to conversation history.")
-    
+    logger.info("Appending verification message to conversation history.", extra=context)
     return {
         "conversation_history": delta_history,
         "verification_result": {
@@ -191,290 +116,264 @@ def verification_node(state: ChatState) -> dict:
         }
     }
 
-# --- Node 5: process_answer_node ---
+# --- Node 5: process_extraction_in_background ---
 def process_extraction_in_background(thread_id: str, idx: int, memory_saver, current_state=None):
     """
     Process extraction in a background thread outside the graph flow.
     """
+    context = {"thread_id": thread_id, "question_index": idx, "function": "process_extraction_in_background"}
     try:
         import time, copy
         time.sleep(0.5)
-        
-        logger.info(f"Background extraction started for index {idx}")
-        
+        logger.info(f"Background extraction started for index {idx}.", extra=context)
+
         if hasattr(memory_saver, "_states"):
-            logger.debug(f"DEBUG: Memory saver states before extraction: {list(memory_saver._states.keys())}")
+            logger.debug(f"DEBUG: Memory saver states before extraction: {list(memory_saver._states.keys())}", extra={"thread_id": thread_id})
             if thread_id in memory_saver._states:
-                logger.debug(f"DEBUG: thread_id {thread_id} exists in memory_saver._states")
-                debug_state = memory_saver._states[thread_id]
-                logger.debug(f"DEBUG: Direct state keys from _states: {list(debug_state.keys())}")
+                logger.debug(f"DEBUG: thread_id {thread_id} exists in memory_saver._states", extra={"thread_id": thread_id})
         
-        state = current_state if current_state is not None else memory_saver.load(thread_id)
+        state_loaded = current_state if current_state is not None else memory_saver.load(thread_id)
+        if not state_loaded:
+            logger.error(f"No state found for thread_id {thread_id}.", extra=context)
+            return
+        logger.info(f"Background extraction using state with keys: {list(state_loaded.keys())}", extra=context)
+        logger.debug(f"DEBUG: Initial extracted_terms: {state_loaded.get('extracted_terms')}", extra=context)
         
-        if not state:
-            logger.error(f"No state found for thread_id {thread_id}")
+        if idx not in state_loaded.get("term_extraction_queue", []):
+            logger.warning(f"Item {idx} not in extraction queue - queue: {state_loaded.get('term_extraction_queue', [])}", extra=context)
             return
-            
-        logger.info(f"Background extraction using state with keys: {list(state.keys())}")
-        logger.debug(f"DEBUG: Initial extracted_terms: {state.get('extracted_terms')}")
+        if idx not in state_loaded.get("verified_answers", {}):
+            logger.error(f"No verified answer found for index {idx}.", extra=context)
+            return
         
-        if idx not in state.get("term_extraction_queue", []):
-            logger.warning(f"Item {idx} not in extraction queue - queue: {state.get('term_extraction_queue', [])}")
-            return
-            
-        if idx not in state.get("verified_answers", {}):
-            logger.error(f"No verified answer found for index {idx}")
-            return
-            
-        verified_item = state["verified_answers"][idx]
+        verified_item = state_loaded["verified_answers"][idx]
         question = verified_item.get("question", "")
         answer = verified_item.get("answer", "")
-        
         from term_extractor import extract_terms
         terms = extract_terms(question, answer)
         
         latest_state = memory_saver.load(thread_id)
         if not latest_state:
-            logger.warning("Could not load latest state before update, using original state")
-            latest_state = state
+            logger.warning("Could not load latest state before update, using original state.", extra=context)
+            latest_state = state_loaded
         
         new_queue = [i for i in latest_state.get("term_extraction_queue", []) if i != idx]
         current_terms = latest_state.get("extracted_terms", {})
         if not isinstance(current_terms, dict):
-            logger.warning(f"extracted_terms is not a dictionary: {current_terms}, creating new dictionary")
+            logger.warning(f"extracted_terms is not a dictionary: {current_terms}. Creating new dictionary.", extra=context)
             current_terms = {}
         
         str_idx = str(idx)
-        updated_terms = {str(k): v for k, v in current_terms.items()}  # Ensure string keys
-        
+        updated_terms = {str(k): v for k, v in current_terms.items()}
         updated_terms[str_idx] = terms
         
-        updated_state = copy.deepcopy(latest_state)  # Use deep copy for the full state
+        updated_state = copy.deepcopy(latest_state)
         updated_state["term_extraction_queue"] = new_queue
         updated_state["extracted_terms"] = updated_terms
         updated_state["last_extracted_index"] = idx
         
-        logger.debug(f"DEBUG: About to save state with keys: {list(updated_state.keys())}")
-        logger.debug(f"DEBUG: extracted_terms keys: {list(updated_state['extracted_terms'].keys())}")
-        logger.info(f"Saving extraction results for index {idx}: {terms[:3] if len(terms) > 3 else terms}... (total: {len(terms)} terms)")
+        logger.debug(f"DEBUG: About to save state with keys: {list(updated_state.keys())}", extra=context)
+        logger.debug(f"DEBUG: extracted_terms keys: {list(updated_state['extracted_terms'].keys())}", extra=context)
+        logger.info(f"Saving extraction results for index {idx}: {terms[:3] if len(terms) > 3 else terms} (total: {len(terms)} terms)", extra=context)
         
         memory_saver.save(thread_id, updated_state)
-        
-        if hasattr(memory_saver, "_states") and thread_id in memory_saver._states:
-            direct_state = memory_saver._states[thread_id]
-            if "extracted_terms" in direct_state:
-                direct_terms = direct_state["extracted_terms"]
-                logger.debug(f"DEBUG: After save - direct _states access - extracted_terms keys: {list(direct_terms.keys())}")
-                if str_idx in direct_terms:
-                    logger.debug(f"DEBUG: Verified direct save - terms for index {str_idx} found in _states")
-        
         verification_state = memory_saver.load(thread_id)
         if verification_state:
             if "extracted_terms" in verification_state:
                 extracted_terms = verification_state["extracted_terms"]
-                logger.debug(f"DEBUG: Verification - extracted_terms keys: {list(extracted_terms.keys())}")
-                
+                logger.debug(f"DEBUG: Verification - extracted_terms keys: {list(extracted_terms.keys())}", extra=context)
                 if str_idx in extracted_terms:
-                    saved_terms = extracted_terms[str_idx]
-                    logger.info(f"Verified successful save of {len(saved_terms)} terms for index {idx}")
+                    logger.info(f"Verified successful save of {len(extracted_terms[str_idx])} terms for index {idx}", extra=context)
                 else:
-                    logger.warning(f"Terms for index {idx} not found in saved state")
+                    logger.warning(f"Terms for index {idx} not found in saved state.", extra=context)
             else:
-                logger.warning("No extracted_terms key in verification state")
+                logger.warning("No extracted_terms key in verification state.", extra=context)
         else:
-            logger.error("Could not verify state save - failed to load for verification")
+            logger.error("Could not verify state save - failed to load for verification.", extra=context)
         
-        logger.info(f"Background extraction completed for index {idx}, found {len(terms)} terms")
+        logger.info(f"Background extraction completed for index {idx}, found {len(terms)} terms.", extra=context)
     except Exception as e:
-        logger.error(f"Background extraction error: {str(e)}")
+        logger.error(f"Background extraction error at index {idx}: {str(e)}", extra=context)
         import traceback
-        logger.error(traceback.format_exc())
+        logger.error(traceback.format_exc(), extra=context)
 
 def process_answer_node(state: ChatState) -> dict:
-    """
-    Processes the verified answer and advances to the next question.
-    It returns updates (deltas) to the state and does not overwrite the accumulated history.
-    """
-    idx = state["current_question_index"]
-    logger.info(f"process_answer_node: Processing answer for question index {idx}.")
-    verification_result = state["verification_result"]
-    if not verification_result or not verification_result.get("is_valid", False):
-        logger.warning("process_answer_node: Verification failed; re-prompting answer.")
-        return {}
-    
-    answer = verification_result.get("answer", "")
-    verified_answers = {**state["verified_answers"]}
-    verified_answers[idx] = {
-        "question": state["questions"][idx]["text"],
-        "answer": answer,
-        "verification": verification_result.get("verification_message", "")
-    }
-    logger.debug(f"process_answer_node: Updated verified_answers: {verified_answers}")
-    
-    term_extraction_queue = state["term_extraction_queue"].copy()
-    if idx not in term_extraction_queue:
-        term_extraction_queue.append(idx)
-        logger.debug(f"process_answer_node: Added index {idx} to extraction queue: {term_extraction_queue}")
+    try:
+        idx = state["current_question_index"]
+        context = get_logging_context(state, extra={"function": "process_answer_node"})
+        logger.info(f"Processing answer for question index {idx}.", extra=context)
         
-        # Create the updated state with the extraction queue that we'll pass to the background thread
-        thread_state = {**state}
-        thread_state["verified_answers"] = verified_answers
-        thread_state["term_extraction_queue"] = term_extraction_queue
+        verification_result = state.get("verification_result", {})
+        if not verification_result or not verification_result.get("is_valid", False):
+            logger.warning("Verification failed; re-prompting answer.", extra=context)
+            return {}
         
-        # Start background extraction immediately using threading
-        thread_id = state.get("thread_id")
-        if thread_id:
-            import threading
-            logger.info(f"process_answer_node: Launching background extraction with thread_id {thread_id} and state snapshot")
-            extraction_thread = threading.Thread(
-                target=lambda: process_extraction_in_background(thread_id, idx, shared_memory, current_state=thread_state),
-                daemon=True
-            )
-            extraction_thread.start()
-            logger.info(f"process_answer_node: Started background extraction for index {idx}")
-    
-    new_index = idx + 1
-    updates = {
-        "current_question_index": new_index,
-        "verified_answers": verified_answers,
-        "term_extraction_queue": term_extraction_queue
-    }
-    if new_index >= len(state["questions"]):
-        updates["is_complete"] = True
-        # Append a final AI message.
-        delta_history = [AIMessage(content="Thank you for completing all the questions. Your responses have been recorded.")]
-        updates["conversation_history"] = delta_history
-        logger.info("process_answer_node: All questions complete.")
-    
-    logger.info(f"process_answer_node: Advancing to question index {new_index}.")
-    return updates
+        answer = verification_result.get("answer", "")
+        verified_answers = {**state["verified_answers"]}
+        verified_answers[idx] = {
+            "question": state["questions"][idx]["text"],
+            "answer": answer,
+            "verification": verification_result.get("verification_message", "")
+        }
+        logger.debug(f"Updated verified_answers: {verified_answers}", extra=context)
+        
+        term_extraction_queue = state["term_extraction_queue"].copy()
+        if idx not in term_extraction_queue:
+            term_extraction_queue.append(idx)
+            logger.debug(f"Added index {idx} to extraction queue: {term_extraction_queue}", extra=context)
+            thread_state = {**state, "verified_answers": verified_answers, "term_extraction_queue": term_extraction_queue}
+            if state.get("thread_id"):
+                try:
+                    import threading
+                    logger.info(f"Launching background extraction for index {idx} with thread_id {state.get('thread_id')}.", extra=context)
+                    extraction_thread = threading.Thread(
+                        target=lambda: process_extraction_in_background(state.get("thread_id"), idx, shared_memory, current_state=thread_state),
+                        daemon=True
+                    )
+                    extraction_thread.start()
+                    logger.info(f"Started background extraction for index {idx}.", extra=context)
+                except Exception as e:
+                    logger.error(f"Error launching background extraction for index {idx}: {str(e)}", extra=context)
+        
+        new_index = idx + 1
+        updates = {
+            "current_question_index": new_index,
+            "verified_answers": verified_answers,
+            "term_extraction_queue": term_extraction_queue
+        }
+        
+        if new_index >= len(state["questions"]):
+            updates["is_complete"] = True
+            delta_history = [AIMessage(content="Thank you for completing all the questions. Your responses have been recorded.")]
+            updates["conversation_history"] = delta_history
+            logger.info("All questions complete.", extra=context)
+        
+        # Recompute context after updating question index
+        new_context = get_logging_context(state, extra={"function": "process_answer_node", "question_index": new_index})
+        logger.info(f"Advancing to question index {new_index}.", extra=new_context)
+        return updates
 
-# --- Import the term extractor ---
-from term_extractor import start_extraction_thread
+    except Exception as ex:
+        logger.error(f"Unexpected error: {str(ex)}", extra=get_logging_context(state, extra={"function": "process_answer_node"}))
+        raise
 
 # --- Node 6: extract_node ---
 def extract_node(state: ChatState) -> Dict:
     """
     Initiates asynchronous term extraction from verified answers.
-    
-    This node processes items in the term extraction queue without blocking the main workflow.
-    It delegates the actual extraction to a background thread to keep the UI responsive.
+    Processes items in the term extraction queue without blocking the main workflow.
+    Delegates the actual extraction to a background thread.
     """
-    logger.info("extract_node: Processing term extraction queue.")
-    logger.info(f"extract_node: Current state term_extraction_queue: {state['term_extraction_queue']}")
+    thread_id = state.get("thread_id")
+    context = get_logging_context(state, extra={"function": "extract_node"})
+    try:
+        logger.info("Processing term extraction queue.", extra=context)
+        logger.info(f"Current term_extraction_queue: {state.get('term_extraction_queue')}", extra=context)
+    except Exception as e:
+        logger.error(f"Error logging extraction queue: {str(e)}", extra=context)
     
-    # Skip if queue is empty
-    if not state["term_extraction_queue"]:
-        logger.info("extract_node: No items in extraction queue.")
+    if not state.get("term_extraction_queue"):
+        logger.info("No items in extraction queue.", extra=context)
         return {}
     
-    # Get the first item from the queue
-    idx = state["term_extraction_queue"][0]
-    logger.info(f"extract_node: Starting extraction for question index {idx}.")
+    try:
+        idx = state["term_extraction_queue"][0]
+        context = get_logging_context(state, extra={"function": "extract_node", "question_index": idx})
+        logger.info(f"Starting extraction for question index {idx}.", extra=context)
+    except Exception as e:
+        logger.error(f"Error retrieving index from extraction queue: {str(e)}", extra=context)
+        return {}
     
-    # For debugging: Check if the item is in verified_answers
-    if idx in state["verified_answers"]:
-        logger.info(f"extract_node: Found verified answer for index {idx}.")
+    if idx in state.get("verified_answers", {}):
+        logger.info(f"Found verified answer for index {idx}.", extra=context)
     else:
-        logger.warning(f"extract_node: No verified answer found for index {idx}.")
-        # Remove from queue and return
-        term_extraction_queue = [i for i in state["term_extraction_queue"] if i != idx]
+        logger.warning(f"No verified answer found for index {idx}. Removing index from queue.", extra=context)
+        term_extraction_queue = [i for i in state.get("term_extraction_queue", []) if i != idx]
         return {"term_extraction_queue": term_extraction_queue}
     
-    # ENHANCED: Try multiple ways to get thread_id
-    thread_id = None
-    
-    # 1. First, check if thread_id is stored directly in state (new approach)
-    if "thread_id" in state:
-        thread_id = state["thread_id"]
-        logger.info(f"extract_node: Retrieved thread_id from state directly: {thread_id}")
-    
-    # 2. Try to get thread_id from memory's parent_config (original approach)
-    if not thread_id and hasattr(memory, 'parent_config') and hasattr(memory.parent_config, 'configurable'):
-        thread_id = memory.parent_config.configurable.get('thread_id')
-        logger.info(f"extract_node: Retrieved thread_id from memory.parent_config: {thread_id}")
-    
-    # 3. Try to get thread_id from state's config attribute (original approach)
-    if not thread_id:
-        try:
-            if hasattr(state, 'config') and hasattr(state.config, 'configurable'):
-                thread_id = state.config.configurable.get('thread_id')
-                logger.info(f"extract_node: Retrieved thread_id from state.config: {thread_id}")
-        except Exception as e:
-            logger.error(f"extract_node: Error getting thread_id from state.config: {str(e)}")
-    
-    # 4. Try to get thread_id from memory's latest threads (new approach)
-    if not thread_id:
-        try:
-            # This is a hacky approach but might work - check if memory has a _threads attribute
-            if hasattr(memory, '_threads') and memory._threads:
-                # Get the most recent thread_id
-                latest_thread_id = list(memory._threads.keys())[-1]
-                thread_id = latest_thread_id
-                logger.info(f"extract_node: Retrieved thread_id from memory._threads: {thread_id}")
-        except Exception as e:
-            logger.error(f"extract_node: Error getting thread_id from memory._threads: {str(e)}")
+    # Attempt thread_id retrieval via multiple methods for redundancy
+    try:
+        if thread_id:
+            logger.info(f"Retrieved thread_id from state directly: {thread_id}", extra={"function": "extract_node", "question_index": idx})
+        if not thread_id and hasattr(memory, 'parent_config') and hasattr(memory.parent_config, 'configurable'):
+            thread_id = memory.parent_config.configurable.get('thread_id')
+            logger.info(f"Retrieved thread_id from memory.parent_config: {thread_id}", extra={"question_index": idx})
+        if not thread_id:
+            try:
+                if hasattr(state, 'config') and hasattr(state.config, 'configurable'):
+                    thread_id = state.config.configurable.get('thread_id')
+                    logger.info(f"Retrieved thread_id from state.config: {thread_id}", extra={"question_index": idx})
+            except Exception as e:
+                logger.error(f"Error getting thread_id from state.config: {str(e)}", extra={"question_index": idx})
+        if not thread_id:
+            try:
+                if hasattr(memory, '_threads') and memory._threads:
+                    latest_thread_id = list(memory._threads.keys())[-1]
+                    thread_id = latest_thread_id
+                    logger.info(f"Retrieved thread_id from memory._threads: {thread_id}", extra={"question_index": idx})
+            except Exception as e:
+                logger.error(f"Error getting thread_id from memory._threads: {str(e)}", extra={"question_index": idx})
+    except Exception as e:
+        logger.error(f"Error during thread_id retrieval: {str(e)}", extra=context)
     
     if not thread_id:
-        logger.error("extract_node: Cannot start async extraction - thread_id not available")
-        # We'll use synchronous extraction as a fallback
-        logger.info("extract_node: Falling back to synchronous extraction")
+        logger.error("Cannot start async extraction - thread_id not available.", extra=context)
+        logger.info("Falling back to synchronous extraction.", extra=context)
         return extract_node_sync(state)
     
-    # Start asynchronous extraction in a separate thread
-    success = start_extraction_thread(state, idx, thread_id, memory)
+    try:
+        success = start_extraction_thread(state, idx, thread_id, memory)
+    except Exception as e:
+        logger.error(f"Exception when starting extraction thread for index {idx}: {str(e)}", extra={"thread_id": thread_id, "question_index": idx})
+        success = False
     
     if success:
-        logger.info(f"extract_node: Async extraction started for index {idx}.")
-        # Remove item from the queue immediately to avoid re-processing
-        # The extraction thread will update the results in the state directly
-        term_extraction_queue = [i for i in state["term_extraction_queue"] if i != idx]
+        logger.info(f"Async extraction started for index {idx}.", extra={"thread_id": thread_id, "question_index": idx})
+        term_extraction_queue = [i for i in state.get("term_extraction_queue", []) if i != idx]
         return {"term_extraction_queue": term_extraction_queue}
     else:
-        logger.error(f"extract_node: Failed to start async extraction for index {idx}.")
-        # Try synchronous extraction as a fallback
-        logger.info("extract_node: Falling back to synchronous extraction")
+        logger.error(f"Failed to start async extraction for index {idx}.", extra={"thread_id": thread_id, "question_index": idx})
+        logger.info("Falling back to synchronous extraction.", extra={"thread_id": thread_id, "question_index": idx})
         return extract_node_sync(state)
 
 # --- Alternate synchronous implementation ---
 # This implementation processes extractions synchronously for testing or fallback
 def extract_node_sync(state: ChatState) -> Dict:
     """
-    Synchronous term extraction processing - can be used as a fallback.
+    Synchronous term extraction processing - fallback implementation.
     """
     from term_extractor import extract_terms
+    context = get_logging_context(state, extra={"function": "extract_node_sync"})
+    logger.info("Running synchronous term extraction.", extra=context)
     
-    logger.info("extract_node_sync: Running synchronous term extraction.")
-    if not state["term_extraction_queue"]:
+    if not state.get("term_extraction_queue"):
         return {}
     
     idx = state["term_extraction_queue"][0]
-    logger.debug(f"extract_node_sync: Processing extraction for index {idx}.")
+    context = get_logging_context(state, extra={"function": "extract_node_sync", "question_index": idx})
+    logger.debug(f"Processing extraction for index {idx}.", extra=context)
     
-    # Get the question and answer
-    if idx in state["verified_answers"]:
+    if idx in state.get("verified_answers", {}):
         verified_item = state["verified_answers"][idx]
         question = verified_item.get("question", "")
         answer = verified_item.get("answer", "")
-        
-        # Extract terms synchronously
         terms = extract_terms(question, answer)
-        
-        # Update state
-        extracted_terms = {**state["extracted_terms"]}
-        term_extraction_queue = state["term_extraction_queue"].copy()
-        
+        extracted_terms = {**state.get("extracted_terms", {})}
+        term_extraction_queue = state.get("term_extraction_queue", []).copy()
         extracted_terms[idx] = terms
-        term_extraction_queue.remove(idx)
-        logger.info(f"extract_node_sync: Extraction complete for index {idx}, found {len(terms)} terms.")
-        
+        try:
+            term_extraction_queue.remove(idx)
+        except Exception as e:
+            logger.warning(f"Could not remove index {idx} from extraction queue: {str(e)}", 
+                           extra=get_logging_context(state, extra={"function": "extract_node_sync", "question_index": idx}))
+        logger.info(f"Extraction complete for index {idx}, found {len(terms)} terms.", extra=context)
         return {
             "extracted_terms": extracted_terms,
             "term_extraction_queue": term_extraction_queue,
             "last_extracted_index": idx
         }
     else:
-        logger.warning(f"extract_node_sync: Index {idx} not found in verified_answers.")
+        logger.warning(f"Index {idx} not found in verified_answers.", extra=context)
         return {}
 
 # --- Node 7: end_node ---
@@ -482,94 +381,62 @@ def end_node(state: ChatState) -> Dict:
     """
     Final node that marks the questionnaire session as complete.
     """
-    logger.info("end_node: Finalizing state and marking session complete.")
+    context = get_logging_context(state, extra={"function": "end_node"})
+    logger.info("Finalizing state and marking session complete.", extra=context)
     return {"is_complete": True}
 
 # --- Define routing logic ---
 def verification_result_router(state: ChatState) -> Literal["process_answer_node", "answer_node"]:
-    """Route based on verification result."""
-    verification_result = state["verification_result"]
-    if verification_result and verification_result.get("is_valid", False):
-        return "process_answer_node"
-    return "answer_node"
+    context = get_logging_context(state, extra={"function": "verification_result_router"})
+    result = "process_answer_node" if state.get("verification_result", {}).get("is_valid", False) else "answer_node"
+    logger.info(f"Routing to {result}.", extra=context)
+    return result
 
 def process_answer_router(state: ChatState) -> Literal["ask_node", "extract_node", "end_node"]:
-    """Route after processing an answer."""
-    # Check if we have a trigger to explicitly process extractions
-    if state.get("trigger_extraction", False) and state["term_extraction_queue"]:
-        logger.info(f"process_answer_router: Extraction trigger detected with queue: {state['term_extraction_queue']}")
-        # Reset the trigger flag
+    context = get_logging_context(state, extra={"function": "process_answer_router"})
+    if state.get("trigger_extraction", False) and state.get("term_extraction_queue"):
+        logger.info(f"Extraction trigger detected with queue: {state['term_extraction_queue']}", extra=context)
         state["trigger_extraction"] = False
         return "extract_node"
-    
-    # First check if we've reached the end of questions
     if state["current_question_index"] >= len(state["questions"]):
-        logger.info("process_answer_router: No more questions, routing to end_node")
-        # If we're at the end and still have extraction tasks, route to extraction
-        if state["term_extraction_queue"]:
-            logger.info(f"process_answer_router: At end of questions with extraction queue: {state['term_extraction_queue']}")
+        logger.info("No more questions, routing to end_node.", extra=context)
+        if state.get("term_extraction_queue"):
+            logger.info(f"Extraction queue present at end: {state['term_extraction_queue']}", extra=context)
             return "extract_node"
         return "end_node"
-    
-    # If we have more questions, prioritize going to the next question over extraction
-    # This ensures the user can continue with the next question while extraction happens in background
-    logger.info(f"process_answer_router: Proceeding to next question {state['current_question_index']}")
+    logger.info(f"Proceeding to next question {state['current_question_index']}.", extra=context)
     return "ask_node"
 
 def extract_router(state: ChatState) -> Literal["extract_node", "end_node"]:
-    """Route during extraction."""
-    # Add debug logging to show the routing decision
-    if state["term_extraction_queue"]:
-        logger.info(f"extract_router: Routing to extract_node with queue: {state['term_extraction_queue']}")
+    context = get_logging_context(state, extra={"function": "extract_router"})
+    if state.get("term_extraction_queue"):
+        logger.info(f"Routing to extract_node with queue: {state['term_extraction_queue']}", extra=context)
         return "extract_node"
-    logger.info("extract_router: No items in extraction queue, routing to end_node")
+    logger.info("No items in extraction queue, routing to end_node.", extra=context)
     return "end_node"
 
 # --- Node 8: tasks_checker ---
 def tasks_checker(state: ChatState) -> Dict:
-    """
-    A utility node to check and potentially start background tasks.
-    This helps ensure that extraction tasks can be processed even
-    when the main flow prioritizes asking the next question.
-    """
-    logger.info("tasks_checker: Checking for pending background tasks.")
-    
-    # Check if there are pending extraction tasks
-    if state["term_extraction_queue"]:
-        logger.info(f"tasks_checker: Found pending extraction tasks: {state['term_extraction_queue']}")
-        
-        # We won't automatically start extraction here, but this node
-        # provides a hook for potentially handling background tasks.
-        # For now, we just log the detection.
-        
-        # In the future, we could add logic to start extraction as a true
-        # background process from this node
-    
-    # No direct state changes, this node is mainly for logging/monitoring
+    context = get_logging_context(state, extra={"function": "tasks_checker"})
+    logger.info("Checking for pending background tasks.", extra=context)
+    if state.get("term_extraction_queue"):
+        logger.info(f"Found pending extraction tasks: {state['term_extraction_queue']}", extra=context)
     return {}
-
-# --- Node 9: trigger_extraction_node ---
-def trigger_extraction_node(state: ChatState) -> Dict:
-    """
-    Handle the trigger_extraction flag and route to process extractions.
-    This node is called when the API's /terms endpoint triggers extraction processing.
-    """
-    logger.info("trigger_extraction_node: Called to handle extraction trigger")
-    
-    if state.get("trigger_extraction", False):
-        logger.info("trigger_extraction_node: Trigger detected, will process extraction queue")
-        # Pass through the trigger flag, don't reset it here
-        return {}
-    else:
-        logger.info("trigger_extraction_node: No trigger detected")
-        return {}
 
 # --- Routing for task checking ---
 def tasks_checker_router(state: ChatState) -> Literal["answer_node"]:
-    """Always route back to answer_node after task checking."""
-    # The tasks_checker is just a monitoring node, we always continue
-    # with the user interaction flow
     return "answer_node"
+
+# --- Node 9: trigger_extraction_node ---
+def trigger_extraction_node(state: ChatState) -> Dict:
+    context = get_logging_context(state, extra={"function": "trigger_extraction_node"})
+    logger.info("Called to handle extraction trigger.", extra=context)
+    if state.get("trigger_extraction", False):
+        logger.info("Trigger detected, will process extraction queue.", extra=context)
+        return {}
+    else:
+        logger.info("No trigger detected.", extra=context)
+        return {}
 
 # --- Routing for trigger extraction ---
 def trigger_extraction_router(state: ChatState) -> Literal["process_answer_node"]:

@@ -85,9 +85,9 @@ def main(use_automated_answers=True):
     
     # Sample predefined answers for automated testing
     sample_answers = [
-        "I was diagnosed with polymicrogyria at 3 months old in June 2018.", #My primary symptoms included speech delays, difficulty with fine motor skills, and occasional seizures that started when I was around 4 years old.
-        "My neurologist recommended physical therapy 3 times a week, speech therapy twice weekly, and prescribed Keppra (levetiracetam) at 500mg twice daily to control the seizures.",
-        "Yes, I have family members with neurological conditions. My father has epilepsy and my maternal aunt was diagnosed with cerebral palsy as a child."
+       "3 months old," # november 20 2014 date of diagnosis and microcephaly was only symptom that led to the diagnosis.
+       # "My neurologist recommended physical therapy 3 times a week, speech therapy twice weekly, and prescribed Keppra (levetiracetam) at 500mg twice daily to control the seizures.",
+       # "Yes, I have family members with neurological conditions. My father has epilepsy and my maternal aunt was diagnosed with cerebral palsy as a child."
     ]
     
     try:
